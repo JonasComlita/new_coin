@@ -106,12 +106,20 @@ class Transaction:
         self.inputs = inputs
         self.outputs = outputs
         self.fee = fee
-        self.nonce = nonce or random.randint(0, 2**32)  # Added nonce for replay protection
-        self.tx_id = self.calculate_tx_id()
+        self.nonce = nonce or random.randint(0, 2**32)
+        self.tx_id = None  # Initialize as None
+        self.tx_id = self.calculate_tx_id()  # Set tx_id after other attributes
 
     def calculate_tx_id(self) -> str:
-        data = json.dumps(self.to_dict(), sort_keys=True)
-        return hashlib.sha256(data.encode()).hexdigest()
+        # Exclude tx_id from the hash calculation to avoid circular dependency
+        data = {
+            "tx_type": self.tx_type.value,
+            "inputs": [i.to_dict() for i in self.inputs],
+            "outputs": [o.to_dict() for o in self.outputs],
+            "fee": self.fee,
+            "nonce": self.nonce
+        }
+        return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
     def sign_transaction(self, private_key: ecdsa.SigningKey, public_key: ecdsa.VerifyingKey) -> None:
         data = json.dumps(self.to_dict(), sort_keys=True).encode()
@@ -125,7 +133,7 @@ class Transaction:
             "outputs": [o.to_dict() for o in self.outputs],
             "fee": self.fee,
             "nonce": self.nonce,
-            "tx_id": self.tx_id
+            "tx_id": self.tx_id  # Now safe to include since it’s set after calculate_tx_id
         }
 
     @classmethod
@@ -133,8 +141,10 @@ class Transaction:
         tx_type = TransactionType(data["tx_type"])
         inputs = [TransactionInput.from_dict(i) for i in data["inputs"]]
         outputs = [TransactionOutput.from_dict(o) for o in data["outputs"]]
-        return cls(tx_type=tx_type, inputs=inputs, outputs=outputs, fee=data["fee"], nonce=data.get("nonce"))
-
+        tx = cls(tx_type=tx_type, inputs=inputs, outputs=outputs, fee=data["fee"], nonce=data.get("nonce"))
+        tx.tx_id = data["tx_id"]  # Set tx_id from serialized data
+        return tx
+    
 class TransactionFactory:
     @staticmethod
     def create_coinbase_transaction(recipient: str, amount: float, block_height: int) -> Transaction:
@@ -314,31 +324,61 @@ class Miner:
         self.blockchain = blockchain
         self.mempool = mempool
         self.wallet_address = wallet_address
-        self.mining_task = None
-        self.loop = asyncio.get_event_loop()
-    
+        self.mining_thread = None
+
     def start_mining(self) -> None:
-        if self.mining_task and not self.mining_task.done():
+        if self.mining_thread and self.mining_thread.is_alive():
+            logger.info("Mining already running")
             return
-        self.mining_task = asyncio.run_coroutine_threadsafe(self._mine_continuously(), self.loop)
-    
+        logger.info("Starting mining thread")
+        self.mining_thread = threading.Thread(target=self._mine_continuously_thread, daemon=True)
+        self.mining_thread.start()
+
     def stop_mining(self) -> None:
-        if self.mining_task:
-            self.mining_task.cancel()
-    
+        if self.mining_thread:
+            logger.info("Stopping mining thread")
+            # Daemon thread stops with program exit; no explicit stop needed
+
+    def _mine_continuously_thread(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self._mine_continuously())
+
     async def _mine_continuously(self) -> None:
+        logger.info("Starting mining loop")
         while True:
+            logger.info("Creating new block")
             self._create_new_block()
+            logger.info("Mining block")
             if await self._mine_current_block():
+                logger.info(f"Mined block {self.current_block.index}")
                 success = await self.blockchain.add_block(self.current_block)
                 if success:
+                    logger.info(f"Block {self.current_block.index} added")
                     tx_ids = [tx.tx_id for tx in self.current_block.transactions]
                     self.mempool.remove_transactions(tx_ids)
                     print(f"Successfully mined block {self.current_block.index}")
                     if hasattr(self.blockchain, 'network'):
                         self.blockchain.network.broadcast_block(self.current_block)
-            await asyncio.sleep(0.1)  # Prevent tight loop
-    
+            await asyncio.sleep(0.01)
+
+    async def _mine_current_block(self) -> bool:
+        target = "0" * self.blockchain.difficulty
+        nonce = 0
+        logger.info(f"Starting to mine block with difficulty {self.blockchain.difficulty}, target: {target}")
+        start_time = time.time()
+        while True:
+            self.current_block.header.nonce = nonce
+            block_hash = self.current_block.header.calculate_hash()
+            if block_hash.startswith(target):
+                self.current_block.header.hash = block_hash
+                logger.info(f"Block mined in {time.time() - start_time:.2f} seconds with nonce {nonce}")
+                return True
+            nonce += 1
+            if nonce % 10000 == 0:
+                logger.info(f"Nonce at {nonce}, hash: {block_hash}")
+                await asyncio.sleep(0)
+
     def _create_new_block(self) -> None:
         latest_block = self.blockchain.chain[-1]
         transactions = self.mempool.get_transactions(1000, 1000000)
@@ -354,19 +394,6 @@ class Miner:
             previous_hash=latest_block.header.hash,
             difficulty=self.blockchain.difficulty
         )
-    
-    async def _mine_current_block(self) -> bool:
-        target = "0" * self.blockchain.difficulty
-        nonce = 0
-        while True:
-            self.current_block.header.nonce = nonce
-            block_hash = self.current_block.header.calculate_hash()
-            if block_hash.startswith(target):
-                self.current_block.header.hash = block_hash
-                return True
-            nonce += 1
-            if nonce % 10000 == 0:
-                await asyncio.sleep(0)  # Yield control
 
 class Blockchain:
     def __init__(self, storage_path: str = "chain.json"):
@@ -1076,6 +1103,7 @@ if __name__ == "__main__":
     time.sleep(1)  # Give Prometheus a moment to start
     port = find_available_port()
     node_id = f"node{port}"
+    logger.info(f"Starting node {node_id} on port {port}")  # Log the port
     blockchain = Blockchain()
     network = BlockchainNetwork(blockchain, node_id, "127.0.0.1", port)
     network_thread = threading.Thread(target=network.run)
