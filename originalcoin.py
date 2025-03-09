@@ -6,9 +6,11 @@ import json
 import time
 import hashlib
 import logging
+import logging.handlers
 import ecdsa
 import os
 import base64
+import ssl
 from typing import List, Dict, Optional, Any, Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -21,24 +23,248 @@ import random
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec, padding
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from datetime import datetime, timedelta
 import socket
-import yaml
 from prometheus_client import Counter, Gauge, start_http_server
+from dotenv import load_dotenv
+import getpass
+from acme import client, messages, challenges
+from josepy import JWKRSA
+from pathlib import Path
+import sqlite3
 
 # Configure logging with rotation
-from logging.handlers import RotatingFileHandler
-handler = RotatingFileHandler("originalcoin.log", maxBytes=5*1024*1024, backupCount=3)
-logging.basicConfig(level=logging.INFO, handlers=[handler])
+handler = logging.handlers.RotatingFileHandler("originalcoin.log", maxBytes=5*1024*1024, backupCount=3)
+logging.basicConfig(level=logging.INFO, handlers=[handler], format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("Blockchain")
 
 # Define Prometheus metrics
 BLOCKS_MINED = Counter('blocks_mined_total', 'Total number of blocks mined')
 PEER_COUNT = Gauge('peer_count', 'Number of connected peers')
 
-# Custom Rate Limiting Middleware
+# Load environment variables
+load_dotenv()
+
+class SecureConfigManager:
+    def __init__(self, app_name: str = "OriginalCoin", config_dir: Optional[str] = None):
+        self.app_name = app_name
+        self.config_dir = Path(config_dir) if config_dir else Path.home() / ".originalcoin"
+        self.config_dir.mkdir(exist_ok=True, parents=True)
+        self.secrets_file = self.config_dir / "secrets.enc"
+        self.config_file = self.config_dir / "config.json"
+        self.cert_file = self.config_dir / "cert.pem"
+        self.key_file = self.config_dir / "key.pem"
+        self.account_key_file = self.config_dir / "account_key.pem"
+        
+        self.default_config = {
+            "network": {
+                "port": 8443,
+                "max_peers": 100,
+                "bootstrap_nodes": ["node1.example.com:8443", "node2.example.com:8443"],
+                "ssl_enabled": True,
+                "max_retries": 3,
+                "acme_directory": "https://acme-v02.api.letsencrypt.org/directory"
+            },
+            "blockchain": {
+                "difficulty": 4,
+                "target_block_time": 60,
+                "halving_interval": 210000,
+                "initial_reward": 50,
+                "max_block_size": 1000000,
+                "sync_interval": 300
+            },
+            "mempool": {"max_size": 5000, "min_fee_rate": 0.00001},
+            "storage": {
+                "blockchain_path": str(self.config_dir / "blockchain.db"),
+                "wallet_path": str(self.config_dir / "wallets.enc")
+            },
+            "security": {
+                "cert_validity_days": 90,
+                "key_rotation_interval": 24 * 3600,
+                "domain": os.environ.get("ORIGINALCOIN_DOMAIN", "localhost")
+            }
+        }
+        
+        self._load_or_create_config()
+        self.secrets_cache = {}
+        self.master_key = None
+        self._initialize_master_key()
+        self._ensure_certificates()
+
+    def _load_or_create_config(self):
+        if not self.config_file.exists():
+            with open(self.config_file, 'w') as f:
+                json.dump(self.default_config, f, indent=4)
+        with open(self.config_file, 'r') as f:
+            self.config = json.load(f)
+        self._deep_update(self.config, self.default_config)
+
+    def _deep_update(self, target: dict, source: dict):
+        for key, value in source.items():
+            if isinstance(value, dict) and key in target:
+                self._deep_update(target[key], value)
+            else:
+                target.setdefault(key, value)
+
+    def _initialize_master_key(self):
+        master_key_env = os.environ.get("ORIGINALCOIN_MASTER_KEY")
+        if master_key_env:
+            self.master_key = base64.urlsafe_b64decode(master_key_env)
+        else:
+            self.master_key = Fernet.generate_key()
+            logger.warning("No master key in environment; generated temporary key. Set ORIGINALCOIN_MASTER_KEY for persistence.")
+
+    def get_config(self, section: str, key: str, default: Any = None) -> Any:
+        return self.config.get(section, {}).get(key, default)
+
+    def set_secret(self, key: str, value: str):
+        cipher = Fernet(self.master_key)
+        encrypted = cipher.encrypt(value.encode())
+        secrets = self._load_secrets()
+        secrets[key] = base64.b64encode(encrypted).decode()
+        with open(self.secrets_file, 'w') as f:
+            json.dump(secrets, f)
+
+    def get_secret(self, key: str) -> Optional[str]:
+        if key in self.secrets_cache:
+            return self.secrets_cache[key]
+        secrets = self._load_secrets()
+        if key in secrets:
+            cipher = Fernet(self.master_key)
+            encrypted = base64.b64decode(secrets[key])
+            value = cipher.decrypt(encrypted).decode()
+            self.secrets_cache[key] = value
+            return value
+        return None
+
+    def _load_secrets(self) -> Dict[str, str]:
+        try:
+            with open(self.secrets_file, 'r') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def encrypt_wallet_data(self, data: Dict[str, Any], password: str) -> tuple[bytes, bytes]:
+        salt = os.urandom(16)
+        kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100000)
+        key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+        cipher = Fernet(key)
+        return cipher.encrypt(json.dumps(data).encode()), salt
+
+    def decrypt_wallet_data(self, encrypted_data: bytes, salt: bytes, password: str) -> Dict[str, Any]:
+        kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100000)
+        key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+        cipher = Fernet(key)
+        return json.loads(cipher.decrypt(encrypted_data).decode())
+
+    def _ensure_certificates(self):
+        if os.environ.get("ORIGINALCOIN_USE_ACME", "false").lower() == "true":
+            self._renew_acme_certificate()
+        elif not self.cert_file.exists() or not self.key_file.exists() or self._is_cert_expired():
+            self._generate_self_signed_certificate()
+
+    def _generate_self_signed_certificate(self):
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        public_key = private_key.public_key()
+        
+        subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, self.get_config("security", "domain"))])
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(public_key)
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.utcnow())
+            .not_valid_after(datetime.utcnow() + timedelta(days=self.get_config("security", "cert_validity_days")))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName(self.get_config("security", "domain"))]), critical=False)
+            .sign(private_key, hashes.SHA256())
+        )
+        
+        with open(self.cert_file, "wb") as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
+        with open(self.key_file, "wb") as f:
+            f.write(private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption()
+            ))
+        logger.info(f"Generated self-signed certificate at {self.cert_file}")
+
+    def _renew_acme_certificate(self):
+        domain = self.get_config("security", "domain")
+        if domain == "localhost":
+            logger.warning("Cannot use ACME with localhost; falling back to self-signed")
+            self._generate_self_signed_certificate()
+            return
+        
+        if not self.account_key_file.exists():
+            account_key = ec.generate_private_key(ec.SECP256R1())
+            with open(self.account_key_file, "wb") as f:
+                f.write(account_key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.TraditionalOpenSSL,
+                    encryption_algorithm=serialization.NoEncryption()
+                ))
+        else:
+            with open(self.account_key_file, "rb") as f:
+                account_key = serialization.load_pem_private_key(f.read(), password=None)
+        
+        acme_client = client.ClientV2(
+            client.ClientNetwork(JWKRSA(key=account_key), directory=self.get_config("network", "acme_directory"))
+        )
+        
+        order = acme_client.new_order([domain])
+        for authz in order.authorizations:
+            challenge = next(ch for ch in authz.challenges if isinstance(ch, challenges.HTTP01))
+            logger.info(f"Add this to your web server at http://{domain}/.well-known/acme-challenge/{challenge.token}: {challenge.validation}")
+            time.sleep(10)  # Simulate manual verification
+            acme_client.answer_challenge(challenge, challenge.validation)
+        
+        csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, domain)
+        ])).sign(account_key, hashes.SHA256())
+        
+        finalized_order = acme_client.finalize_order(order, datetime.utcnow() + timedelta(days=1), csr)
+        with open(self.cert_file, "wb") as f:
+            f.write(finalized_order.fullchain_pem.encode())
+        with open(self.key_file, "wb") as f:
+            f.write(account_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption()
+            ))
+        logger.info(f"Renewed certificate via ACME at {self.cert_file}")
+
+    def _is_cert_expired(self) -> bool:
+        try:
+            with open(self.cert_file, "rb") as f:
+                cert = x509.load_pem_x509_certificate(f.read())
+            return cert.not_valid_after < datetime.utcnow()
+        except Exception:
+            return True
+
+    def get_tls_config(self) -> Dict[str, str]:
+        return {"cert": str(self.cert_file), "key": str(self.key_file)}
+
+    def generate_auth_key(self) -> str:
+        random_bytes = os.urandom(32)
+        auth_key = base64.urlsafe_b64encode(random_bytes).decode('utf-8')
+        self.set_secret("auth_key", auth_key)
+        return auth_key
+
+    def rotate_auth_key(self) -> str:
+        new_key = self.generate_auth_key()
+        logger.info("Authentication key rotated")
+        return new_key
+
+config_manager = SecureConfigManager()
+
 async def rate_limit_middleware(app, handler):
     async def middleware_handler(request):
-        # Simple rate limiting: 100 requests per minute per IP
         client_ip = request.remote
         if not hasattr(app, '_rate_limit'):
             app._rate_limit = {}
@@ -55,13 +281,6 @@ async def rate_limit_middleware(app, handler):
         app._rate_limit[client_ip]['count'] += 1
         return await handler(request)
     return middleware_handler
-
-# Load configuration from file
-def load_config(config_file="config.yaml"):
-    with open(config_file, 'r') as f:
-        return yaml.safe_load(f)
-
-CONFIG = load_config()
 
 class TransactionType(Enum):
     COINBASE = "coinbase"
@@ -107,11 +326,10 @@ class Transaction:
         self.outputs = outputs
         self.fee = fee
         self.nonce = nonce or random.randint(0, 2**32)
-        self.tx_id = None  # Initialize as None
-        self.tx_id = self.calculate_tx_id()  # Set tx_id after other attributes
+        self.tx_id = None
+        self.tx_id = self.calculate_tx_id()
 
     def calculate_tx_id(self) -> str:
-        # Exclude tx_id from the hash calculation to avoid circular dependency
         data = {
             "tx_type": self.tx_type.value,
             "inputs": [i.to_dict() for i in self.inputs],
@@ -133,7 +351,7 @@ class Transaction:
             "outputs": [o.to_dict() for o in self.outputs],
             "fee": self.fee,
             "nonce": self.nonce,
-            "tx_id": self.tx_id  # Now safe to include since it’s set after calculate_tx_id
+            "tx_id": self.tx_id
         }
 
     @classmethod
@@ -142,9 +360,9 @@ class Transaction:
         inputs = [TransactionInput.from_dict(i) for i in data["inputs"]]
         outputs = [TransactionOutput.from_dict(o) for o in data["outputs"]]
         tx = cls(tx_type=tx_type, inputs=inputs, outputs=outputs, fee=data["fee"], nonce=data.get("nonce"))
-        tx.tx_id = data["tx_id"]  # Set tx_id from serialized data
+        tx.tx_id = data["tx_id"]
         return tx
-    
+
 class TransactionFactory:
     @staticmethod
     def create_coinbase_transaction(recipient: str, amount: float, block_height: int) -> Transaction:
@@ -159,7 +377,7 @@ class BlockHeader:
         self.previous_hash = previous_hash
         self.timestamp = timestamp
         self.difficulty = difficulty
-        self.merkle_root = merkle_root  # Added Merkle root
+        self.merkle_root = merkle_root
         self.nonce = nonce
         self.hash = self.calculate_hash()
 
@@ -185,8 +403,8 @@ class BlockHeader:
             previous_hash=data["previous_hash"],
             timestamp=data["timestamp"],
             difficulty=data["difficulty"],
-            merkle_root=data.get("merkle_root", "0" * 64),  # Default to zero-hash if missing
-            nonce=data.get("nonce", 0)  # Ensure nonce has a default too
+            merkle_root=data.get("merkle_root", "0" * 64),
+            nonce=data.get("nonce", 0)
         )
 
 def calculate_merkle_root(transactions: List[Transaction]) -> str:
@@ -229,7 +447,7 @@ class Block:
 class UTXOSet:
     def __init__(self):
         self.utxos: Dict[str, Dict[int, TransactionOutput]] = {}
-        self.used_nonces: Dict[str, set] = {}  # Track nonces per address for replay protection
+        self.used_nonces: Dict[str, set] = {}
 
     def update_with_block(self, block: Block) -> None:
         for tx in block.transactions:
@@ -239,7 +457,6 @@ class UTXOSet:
                         del self.utxos[tx_input.tx_id][tx_input.output_index]
                         if not self.utxos[tx_input.tx_id]:
                             del self.utxos[tx_input.tx_id]
-                # Record nonce for regular transactions
                 if tx.inputs and tx.nonce:
                     address = SecurityUtils.public_key_to_address(tx.inputs[0].public_key)
                     if address not in self.used_nonces:
@@ -270,13 +487,12 @@ class UTXOSet:
 class Mempool:
     def __init__(self):
         self.transactions: Dict[str, Transaction] = {}
-        self.timestamps: Dict[str, float] = {}  # Track transaction age
+        self.timestamps: Dict[str, float] = {}
+        self.max_size = config_manager.get_config("mempool", "max_size")
 
     def add_transaction(self, tx: Transaction) -> bool:
-        max_size = CONFIG["mempool_max_size"]
         if tx.tx_id not in self.transactions:
-            if len(self.transactions) >= max_size:
-                # Evict oldest transaction if over capacity
+            if len(self.transactions) >= self.max_size:
                 oldest_tx_id = min(self.timestamps.items(), key=lambda x: x[1])[0]
                 del self.transactions[oldest_tx_id]
                 del self.timestamps[oldest_tx_id]
@@ -286,8 +502,11 @@ class Mempool:
         return False
 
     def get_transactions(self, max_txs: int, max_size: int) -> List[Transaction]:
-        sorted_txs = sorted(self.transactions.values(), key=lambda tx: tx.fee, reverse=True)
-        # Remove transactions older than 24 hours
+        sorted_txs = sorted(
+            self.transactions.values(),
+            key=lambda tx: (tx.fee / (len(json.dumps(tx.to_dict())) / 1024), -self.timestamps[tx.tx_id]),
+            reverse=True
+        )
         now = time.time()
         expired = [tx_id for tx_id, ts in self.timestamps.items() if now - ts > 24 * 3600]
         for tx_id in expired:
@@ -337,7 +556,7 @@ class Miner:
     def stop_mining(self) -> None:
         if self.mining_thread:
             logger.info("Stopping mining thread")
-            # Daemon thread stops with program exit; no explicit stop needed
+            # Daemon thread stops with program exit
 
     def _mine_continuously_thread(self) -> None:
         loop = asyncio.new_event_loop()
@@ -345,19 +564,14 @@ class Miner:
         loop.run_until_complete(self._mine_continuously())
 
     async def _mine_continuously(self) -> None:
-        logger.info("Starting mining loop")
         while True:
-            logger.info("Creating new block")
             self._create_new_block()
-            logger.info("Mining block")
             if await self._mine_current_block():
-                logger.info(f"Mined block {self.current_block.index}")
                 success = await self.blockchain.add_block(self.current_block)
                 if success:
-                    logger.info(f"Block {self.current_block.index} added")
                     tx_ids = [tx.tx_id for tx in self.current_block.transactions]
                     self.mempool.remove_transactions(tx_ids)
-                    print(f"Successfully mined block {self.current_block.index}")
+                    logger.info(f"Successfully mined block {self.current_block.index}")
                     if hasattr(self.blockchain, 'network'):
                         self.blockchain.network.broadcast_block(self.current_block)
             await asyncio.sleep(0.01)
@@ -365,23 +579,19 @@ class Miner:
     async def _mine_current_block(self) -> bool:
         target = "0" * self.blockchain.difficulty
         nonce = 0
-        logger.info(f"Starting to mine block with difficulty {self.blockchain.difficulty}, target: {target}")
-        start_time = time.time()
         while True:
             self.current_block.header.nonce = nonce
             block_hash = self.current_block.header.calculate_hash()
             if block_hash.startswith(target):
                 self.current_block.header.hash = block_hash
-                logger.info(f"Block mined in {time.time() - start_time:.2f} seconds with nonce {nonce}")
                 return True
             nonce += 1
             if nonce % 10000 == 0:
-                logger.info(f"Nonce at {nonce}, hash: {block_hash}")
                 await asyncio.sleep(0)
 
     def _create_new_block(self) -> None:
         latest_block = self.blockchain.chain[-1]
-        transactions = self.mempool.get_transactions(1000, 1000000)
+        transactions = self.mempool.get_transactions(1000, config_manager.get_config("blockchain", "max_block_size"))
         coinbase_tx = TransactionFactory.create_coinbase_transaction(
             recipient=self.wallet_address,
             amount=self.blockchain.current_reward,
@@ -396,15 +606,22 @@ class Miner:
         )
 
 class Blockchain:
-    def __init__(self, storage_path: str = "chain.json"):
+    def __init__(self, storage_path: str = None):
         self.chain: List[Block] = []
-        self.storage_path = storage_path
-        self.difficulty = CONFIG["difficulty"]
-        self.current_reward = CONFIG["current_reward"]
-        self.halving_interval = CONFIG["halving_interval"]
+        self.storage_path = storage_path or config_manager.get_config("storage", "blockchain_path")
+        self.chain = []
+        self.db = sqlite3.connect(self.storage_path)
+        self.db.execute('''CREATE TABLE IF NOT EXISTS blocks (
+                            index INTEGER PRIMARY KEY,
+                            data TEXT NOT NULL
+                        )''')
+        self.load_chain()
+        self.difficulty = config_manager.get_config("blockchain", "difficulty")
+        self.current_reward = config_manager.get_config("blockchain", "initial_reward")
+        self.halving_interval = config_manager.get_config("blockchain", "halving_interval")
         self.mempool = Mempool()
         self.utxo_set = UTXOSet()
-        self.orphans: Dict[str, Block] = {}  # Orphan block pool
+        self.orphans: Dict[str, Block] = {}
         self.lock = threading.Lock()
         self.listeners = {"new_block": [], "new_transaction": []}
         self.load_chain()
@@ -417,102 +634,72 @@ class Blockchain:
         for callback in self.listeners[event]:
             callback(data)
 
-    def load_chain(self) -> None:
-        try:
-            with open(self.storage_path, 'r') as f:
-                chain_data = json.load(f)
-                self.chain = [Block.from_dict(block) for block in chain_data]
-                for block in self.chain:
-                    self.utxo_set.update_with_block(block)
-        except (FileNotFoundError, json.JSONDecodeError):
+    def load_chain(self):
+        cursor = self.db.execute("SELECT data FROM blocks ORDER BY index")
+        self.chain = [Block.from_dict(json.loads(row[0])) for row in cursor.fetchall()]
+        if not self.chain:
             genesis_block = Block(index=0, transactions=[], previous_hash="0" * 64, difficulty=self.difficulty)
             self.chain.append(genesis_block)
             self.save_chain()
 
-    def save_chain(self) -> None:
-        with open(self.storage_path, 'w') as f:
-            json.dump([block.to_dict() for block in self.chain], f)
+    def save_chain(self):
+        with self.lock:
+            self.db.execute("DELETE FROM blocks")
+            for block in self.chain:
+                self.db.execute("INSERT INTO blocks (index, data) VALUES (?, ?)", (block.index, json.dumps(block.to_dict())))
+            self.db.commit()
 
     async def validate_block(self, block: Block) -> bool:
-        """
-        Validate a block before adding it to the chain.
-        Returns True if the block is valid, False otherwise.
-        """
-        # Check index and timestamp consistency
         if block.index > 0:
             if block.index > len(self.chain):
-                logger.info(f"Block {block.header.hash[:8]} index {block.index} exceeds chain length {len(self.chain)} - potential orphan")
-                return False  # Handle orphans in add_block
+                return False
             prev_block = self.chain[block.index - 1]
             if block.header.timestamp <= prev_block.header.timestamp:
-                logger.info(f"Block {block.header.hash[:8]} timestamp {block.header.timestamp} not after previous {prev_block.header.timestamp}")
                 return False
             if block.header.previous_hash != prev_block.header.hash:
-                logger.info(f"Block {block.header.hash[:8]} previous hash mismatch")
                 return False
 
-        # Prevent blocks too far in the future
-        if block.header.timestamp > time.time() + 2 * 3600:  # Max 2 hours ahead
-            logger.info(f"Block {block.header.hash[:8]} timestamp {block.header.timestamp} too far in future")
+        if block.header.timestamp > time.time() + 2 * 3600:
             return False
 
-        # Validate coinbase transaction (must be first and within reward)
         if not block.transactions or block.transactions[0].tx_type != TransactionType.COINBASE:
-            logger.info(f"Block {block.header.hash[:8]} missing or invalid coinbase transaction")
             return False
         coinbase_amount = sum(o.amount for o in block.transactions[0].outputs)
         if coinbase_amount > self.current_reward:
-            logger.info(f"Block {block.header.hash[:8]} coinbase amount {coinbase_amount} exceeds reward {self.current_reward}")
             return False
 
-        # Check for double-spending within the block
         spent_utxos = set()
-        for tx in block.transactions[1:]:  # Skip coinbase
+        for tx in block.transactions[1:]:
             if tx.tx_type == TransactionType.COINBASE:
-                logger.info(f"Block {block.header.hash[:8]} contains multiple coinbase transactions")
                 return False
             for tx_input in tx.inputs:
                 utxo_key = (tx_input.tx_id, tx_input.output_index)
                 if utxo_key in spent_utxos:
-                    logger.info(f"Block {block.header.hash[:8]} failed: double-spend detected")
                     return False
                 spent_utxos.add(utxo_key)
-                # Check nonce replay protection
                 if tx_input.public_key:
                     address = SecurityUtils.public_key_to_address(tx_input.public_key)
                     if self.utxo_set.is_nonce_used(address, tx.nonce):
-                        logger.info(f"Block {block.header.hash[:8]} failed: nonce {tx.nonce} reused for {address}")
                         return False
 
-        # Verify proof-of-work
         target = "0" * block.header.difficulty
         if not block.header.hash.startswith(target):
-            logger.info(f"Block {block.header.hash[:8]} failed: hash {block.header.hash} does not meet difficulty {self.difficulty}")
             return False
 
-        # Validate Merkle root
         calculated_merkle_root = calculate_merkle_root(block.transactions)
         if block.header.merkle_root != calculated_merkle_root:
-            logger.info(f"Block {block.header.hash[:8]} failed: Merkle root mismatch")
             return False
 
-        # Asynchronously validate all transactions
         tasks = [asyncio.create_task(self.validate_transaction(tx)) for tx in block.transactions]
         results = await asyncio.gather(*tasks)
-        if not all(results):
-            logger.info(f"Block {block.header.hash[:8]} failed: contains invalid transactions")
-            return False
-
-        logger.info(f"Block {block.header.hash[:8]} validated successfully")
-        return True
+        return all(results)
 
     async def add_block(self, block: Block) -> bool:
         with self.lock:
             if any(b.header.hash == block.header.hash for b in self.chain):
-                logger.info(f"Block {block.header.hash[:8]} already in chain")
                 return False
             if block.index == len(self.chain) and block.header.previous_hash == self.chain[-1].header.hash:
-                if await self.validate_block(block):  # Await async validation
+                if await self.validate_block(block):
                     self.chain.append(block)
                     self.utxo_set.update_with_block(block)
                     if len(self.chain) % 2016 == 0:
@@ -522,8 +709,7 @@ class Blockchain:
                     self.trigger_event("new_block", block)
                     self.save_chain()
                     self._process_orphans()
-                    BLOCKS_MINED.inc()  # NEW: Increment blocks mined counter
-                    logger.info(f"Added block {block.index} to chain: {block.header.hash[:8]}")
+                    BLOCKS_MINED.inc()
                     return True
             else:
                 self.handle_potential_fork(block)
@@ -538,7 +724,7 @@ class Blockchain:
                     self.trigger_event("new_block", orphan)
                     self.save_chain()
                     del self.orphans[hash]
-                    self._process_orphans()  # Recursive check
+                    self._process_orphans()
                     break
 
     def create_transaction(self, sender_private_key: str, sender_address: str, recipient_address: str, amount: float, fee: float = 0.001) -> Optional[Transaction]:
@@ -566,32 +752,25 @@ class Blockchain:
 
     async def validate_transaction(self, tx: Transaction) -> bool:
         if tx.tx_type == TransactionType.COINBASE:
-            logger.info(f"Transaction {tx.tx_id[:8]} is coinbase, auto-validated")
             return True
         if not tx.inputs or not tx.outputs:
-            logger.info(f"Transaction {tx.tx_id[:8]} failed: no inputs or outputs")
             return False
         input_sum = 0
         for tx_input in tx.inputs:
             utxo = self.utxo_set.get_utxo(tx_input.tx_id, tx_input.output_index)
             if not utxo or not tx_input.public_key or not tx_input.signature:
-                logger.info(f"Transaction {tx.tx_id[:8]} failed: UTXO or signature missing")
                 return False
             address = SecurityUtils.public_key_to_address(tx_input.public_key)
             if address != utxo.recipient or self.utxo_set.is_nonce_used(address, tx.nonce):
-                logger.info(f"Transaction {tx.tx_id[:8]} failed: address mismatch or nonce reused")
                 return False
             public_key_obj = ecdsa.VerifyingKey.from_string(bytes.fromhex(tx_input.public_key), curve=ecdsa.SECP256k1)
             try:
                 public_key_obj.verify(tx_input.signature, json.dumps(tx.to_dict(), sort_keys=True).encode())
             except ecdsa.BadSignatureError:
-                logger.info(f"Transaction {tx.tx_id[:8]} failed: invalid signature")
                 return False
             input_sum += utxo.amount
         output_sum = sum(output.amount for output in tx.outputs)
-        valid = output_sum <= input_sum and abs(input_sum - output_sum - tx.fee) < 0.0001
-        logger.info(f"Transaction {tx.tx_id[:8]} validation: input_sum={input_sum}, output_sum={output_sum}, fee={tx.fee}, valid={valid}")
-        return valid
+        return output_sum <= input_sum and abs(input_sum - output_sum - tx.fee) < 0.0001
 
     def add_transaction_to_mempool(self, tx: Transaction) -> bool:
         if not self.validate_transaction(tx):
@@ -609,11 +788,11 @@ class Blockchain:
             return
         period_blocks = self.chain[-2016:]
         time_taken = period_blocks[-1].header.timestamp - period_blocks[0].header.timestamp
-        target_time = 2016 * 60  # 1 minute per block
+        target_time = 2016 * config_manager.get_config("blockchain", "target_block_time")
         if time_taken == 0:
             return
         ratio = target_time / time_taken
-        self.difficulty = max(1, min(20, int(self.difficulty * ratio)))  # Higher max difficulty
+        self.difficulty = max(1, min(20, int(self.difficulty * ratio)))
 
     def halve_block_reward(self) -> None:
         self.current_reward /= 2
@@ -631,7 +810,7 @@ class Blockchain:
         for peer_id, (host, port) in self.network.peers.items():
             try:
                 async with aiohttp.ClientSession() as session:
-                    url = f"http://{host}:{port}/get_chain"
+                    url = f"https://{host}:{port}/get_chain"
                     async with session.get(url) as response:
                         if response.status == 200:
                             chain_data = await response.json()
@@ -642,7 +821,7 @@ class Blockchain:
                 logger.error(f"Error requesting chain from {peer_id}: {e}")
 
     def validate_and_replace_chain(self, new_chain: List[Block]) -> bool:
-        current_work = sum(b.header.difficulty for b in self.chain) + len(self.orphans) * self.difficulty  # Include orphans
+        current_work = sum(b.header.difficulty for b in self.chain) + len(self.orphans) * self.difficulty
         new_work = sum(b.header.difficulty for b in new_chain)
         if new_work <= current_work or not self.validate_chain(new_chain):
             return False
@@ -671,54 +850,123 @@ class BlockchainNetwork:
         self.node_id = node_id
         self.host = host
         self.port = port
-        self.peers: Dict[str, tuple[str, int]] = {}
+        self.peers: Dict[str, tuple[str, int, str]] = {}
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
-        self.app = aiohttp.web.Application(middlewares=[rate_limit_middleware])  # Use custom middleware
+        self.app = aiohttp.web.Application(middlewares=[rate_limit_middleware])
         self.app.add_routes([
             aiohttp.web.post('/receive_block', self.receive_block),
             aiohttp.web.post('/receive_transaction', self.receive_transaction),
-            aiohttp.web.get('/get_chain', self.get_chain)
+            aiohttp.web.get('/get_chain', self.get_chain),
+            aiohttp.web.post('/update_auth_key', self.receive_auth_key),
+            aiohttp.web.get('/get_peers', self.get_peers)
         ])
         self.blockchain.network = self
+        self.config_manager = config_manager
+        self.private_key, self.public_key = self._generate_node_keypair()
+        self.public_key_str = self.public_key.to_string().hex()
+        self.running = True
+        self.peer_file = config_manager.config_dir / "peers.json"
+        self.load_peers()
 
-    def add_peer(self, peer_id: str, host: str, port: int, auth_key: str = None):
-        expected_key = "some_shared_secret"  # Replace with secure key management
-        if auth_key != expected_key:
-            logger.warning(f"Peer {peer_id} failed authentication")
+    def _generate_node_keypair(self) -> tuple[ecdsa.SigningKey, ecdsa.VerifyingKey]:
+        private_key = ecdsa.SigningKey.generate(curve=ecdsa.SECP256k1)
+        return private_key, private_key.get_verifying_key()
+    
+    def load_peers(self):
+        try:
+            with open(self.peer_file, 'r') as f:
+                peers = json.load(f)
+                for peer_id, (host, port, pub_key) in peers.items():
+                    self.add_peer(peer_id, host, port, self.config_manager.get_secret("auth_key"), pub_key)
+        except FileNotFoundError:
+            pass
+
+    def add_peer(self, peer_id: str, host: str, port: int, auth_key: str = None, peer_public_key: str = None):
+        expected_key = self.config_manager.get_secret("auth_key")
+        if not expected_key:
+            expected_key = self.config_manager.generate_auth_key()
+        if auth_key != expected_key or not peer_public_key:
+            logger.warning(f"Peer {peer_id} failed authentication or missing public key")
             return
-        self.peers[peer_id] = (host, port)
+        self.peers[peer_id] = (host, port, peer_public_key)
+        logger.info(f"Authenticated peer {peer_id} added: {host}:{port}")
+        PEER_COUNT.set(len(self.peers))
+        self.save_peers()
+
+    def save_peers(self):
+        with open(self.peer_file, 'w') as f:
+            json.dump({peer_id: (host, port, pub_key) for peer_id, (host, port, pub_key) in self.peers.items()}, f)
 
     def run(self) -> None:
         runner = aiohttp.web.AppRunner(self.app)
         self.loop.run_until_complete(runner.setup())
-        site = aiohttp.web.TCPSite(runner, self.host, self.port)
+        
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls_config = self.config_manager.get_tls_config()
+        ssl_context.load_cert_chain(certfile=tls_config["cert"], keyfile=tls_config["key"])
+        ssl_context.verify_mode = ssl.CERT_REQUIRED
+        ssl_context.load_verify_locations(cafile=str(config_manager.cert_file))
+        
+        site = aiohttp.web.TCPSite(runner, self.host, self.port, ssl_context=ssl_context)
         self.loop.run_until_complete(site.start())
+        logger.info(f"Network server running on https://{self.host}:{self.port}")
         self.loop.run_forever()
+        try:
+            self.loop.run_forever()
+        except KeyboardInterrupt:
+            self.shutdown()
 
-    async def send_with_retry(self, url: str, data: dict, method: str = "post", max_retries: int = CONFIG["max_retries"]):
+    def shutdown(self):
+        self.running = False
+        tasks = asyncio.all_tasks(self.loop)
+        for task in tasks:
+            task.cancel()
+        self.loop.run_until_complete(self.app.shutdown())
+        self.loop.run_until_complete(self.app.cleanup())
+        self.loop.close()
+        logger.info("Network server shut down")
+
+    async def send_with_retry(self, url: str, data: dict, method: str = "post", max_retries: int = config_manager.get_config("network", "max_retries")):
+        peer_id = next((pid for pid, (h, p, _) in self.peers.items() if f"{h}:{p}" in url), None)
         for attempt in range(max_retries):
             try:
-                async with aiohttp.ClientSession() as session:
-                    if method == "post":
-                        async with session.post(url, json=data, timeout=aiohttp.ClientTimeout(total=5)) as response:
-                            return response.status == 200
-                    elif method == "get":
-                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as response:
-                            return response.status == 200, await response.json()
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    logger.error(f"Failed after {max_retries} attempts: {e}")
-                    return False if method == "post" else (False, None)
-                await asyncio.sleep(0.5 * (2 ** attempt))  # Faster backoff: 0.5s, 1s, 2s
+                ssl_context = ssl.create_default_context(cafile=str(config_manager.cert_file))
+                ssl_context.verify_mode = ssl.CERT_REQUIRED
+                
+                for attempt in range(max_retries):
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            if method == "post":
+                                async with session.post(url, json=data, ssl=ssl_context, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                                    return response.status == 200
+                            elif method == "get":
+                                async with session.get(url, ssl=ssl_context, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                                    return response.status == 200, await response.json()
+                    except Exception as e:
+                        if attempt == max_retries - 1:
+                            logger.error(f"Failed after {max_retries} attempts to {url}: {e}")
+                            return False if method == "post" else (False, None)
+                        await asyncio.sleep(0.5 * (2 ** attempt))
+                if peer_id:
+                    self.peers[peer_id] = (self.peers[peer_id][0], self.peers[peer_id][1], self.peers[peer_id][2])  # Reset failure count implicitly
+                return response.status == 200 if method == "post" else (response.status == 200, await response.json())
+            except aiohttp.ClientConnectionError as e:
+                if peer_id and attempt == max_retries - 1:
+                    logger.warning(f"Removing unresponsive peer {peer_id} after {max_retries} attempts")
+                    del self.peers[peer_id]
+                    self.save_peers()
+                    PEER_COUNT.set(len(self.peers))
+                await asyncio.sleep(0.5 * (2 ** attempt))
+        return False if method == "post" else (False, None)
 
     def broadcast_block(self, block: Block) -> None:
-        tasks = [self.send_block(peer_id, host, port, block) for peer_id, (host, port) in self.peers.items() if peer_id != self.node_id]
+        tasks = [self.send_block(peer_id, host, port, block) for peer_id, (host, port, _) in self.peers.items() if peer_id != self.node_id]
         if tasks:
             asyncio.run_coroutine_threadsafe(asyncio.gather(*tasks, return_exceptions=True), self.loop)
 
     async def send_block(self, peer_id: str, host: str, port: int, block: Block) -> None:
-        url = f"http://{host}:{port}/receive_block"
+        url = f"https://{host}:{port}/receive_block"
         data = {"block": block.to_dict()}
         success = await self.send_with_retry(url, data)
         if success:
@@ -735,15 +983,17 @@ class BlockchainNetwork:
         return aiohttp.web.Response(status=200)
 
     async def broadcast_transaction(self, tx: Transaction) -> None:
-        tasks = [self.send_transaction(peer_id, host, port, tx) for peer_id, (host, port) in self.peers.items() if peer_id != self.node_id]
+        tasks = [self.send_transaction(peer_id, host, port, tx) for peer_id, (host, port, _) in self.peers.items() if peer_id != self.node_id]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def send_transaction(self, peer_id: str, host: str, port: int, tx: Transaction) -> None:
-        url = f"http://{host}:{port}/receive_transaction"
+        url = f"https://{host}:{port}/receive_transaction"
         data = {"transaction": tx.to_dict()}
         success = await self.send_with_retry(url, data)
-        if not success:
+        if success:
+            logger.info(f"Sent transaction {tx.tx_id[:8]} to {peer_id}")
+        else:
             logger.error(f"Failed to send transaction to {peer_id}")
 
     async def receive_transaction(self, request: aiohttp.web.Request) -> aiohttp.web.Response:
@@ -752,38 +1002,112 @@ class BlockchainNetwork:
         self.blockchain.add_transaction_to_mempool(tx)
         return aiohttp.web.Response(status=200)
 
+    async def broadcast_auth_key(self, new_key: str):
+        tasks = []
+        for peer_id, (host, port, peer_public_key) in self.peers.items():
+            try:
+                peer_pub_key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), bytes.fromhex(peer_public_key))
+                encrypted_key = peer_pub_key.encrypt(
+                    new_key.encode(),
+                    padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+                )
+                data = {
+                    "encrypted_key": base64.b64encode(encrypted_key).decode(),
+                    "signature": self.private_key.sign(new_key.encode()).hex()
+                }
+                tasks.append(self.send_auth_key(peer_id, host, port, data))
+            except Exception as e:
+                logger.error(f"Failed to encrypt auth key for {peer_id}: {e}")
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def send_auth_key(self, peer_id: str, host: str, port: int, data: dict):
+        url = f"https://{host}:{port}/update_auth_key"
+        success = await self.send_with_retry(url, data)
+        if success:
+            logger.info(f"Sent new auth key to {peer_id}")
+        else:
+            logger.warning(f"Failed to send auth key to {peer_id}")
+
+    async def receive_auth_key(self, request: aiohttp.web.Request) -> aiohttp.web.Response:
+        data = await request.json()
+        encrypted_key = base64.b64decode(data["encrypted_key"])
+        signature = bytes.fromhex(data["signature"])
+        
+        for peer_id, (_, _, pub_key_str) in self.peers.items():
+            try:
+                peer_pub_key = ecdsa.VerifyingKey.from_string(bytes.fromhex(pub_key_str), curve=ecdsa.SECP256k1)
+                if peer_pub_key.verify(signature, encrypted_key):
+                    private_key = ec.EllipticCurvePrivateKey.from_private_numbers(
+                        self.private_key.privkey.secret_multiplier, ec.SECP256R1()
+                    )
+                    new_key = private_key.decrypt(
+                        encrypted_key,
+                        padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+                    ).decode()
+                    self.config_manager.set_secret("auth_key", new_key)
+                    logger.info(f"Received and updated auth key from {peer_id}")
+                    break
+            except Exception as e:
+                logger.debug(f"Failed to verify or decrypt auth key from {peer_id}: {e}")
+                continue
+        return aiohttp.web.Response(status=200)
+
     async def get_chain(self, request: aiohttp.web.Request) -> aiohttp.web.Response:
         return aiohttp.web.json_response([block.to_dict() for block in self.blockchain.chain])
 
     async def request_chain(self) -> None:
-        for peer_id, (host, port) in self.peers.items():
-            url = f"http://{host}:{port}/get_chain"
-            success, chain_data = await self.send_with_retry(url, {}, method="get")
-            if success:
-                new_chain = [Block.from_dict(b) for b in chain_data]
-                if self.blockchain.validate_and_replace_chain(new_chain):
-                    break
+        for peer_id, (host, port, _) in self.peers.items():
+            try:
+                url = f"https://{host}:{port}/get_chain"
+                success, chain_data = await self.send_with_retry(url, {}, method="get")
+                if success:
+                    new_chain = [Block.from_dict(b) for b in chain_data]
+                    if self.blockchain.validate_and_replace_chain(new_chain):
+                        logger.info(f"Chain updated from peer {peer_id}")
+                        break
+            except Exception as e:
+                logger.error(f"Error requesting chain from {peer_id}: {e}")
 
-    def start_periodic_sync(self, interval=CONFIG["sync_interval"]):
+    def start_periodic_sync(self, interval=config_manager.get_config("blockchain", "sync_interval")):
         async def sync_task():
             while True:
                 await self.request_chain()
                 await asyncio.sleep(interval)
         asyncio.run_coroutine_threadsafe(sync_task(), self.loop)
 
-    async def discover_peers(self, bootstrap_host: str, bootstrap_port: int):
-        url = f"http://{bootstrap_host}:{bootstrap_port}/get_peers"
-        success, peer_data = await self.send_with_retry(url, {}, method="get")
-        if success:
-            for peer_id, (host, port) in peer_data.items():
-                self.add_peer(peer_id, host, port, "some_shared_secret")
+    def start_key_rotation(self, interval=config_manager.get_config("security", "key_rotation_interval")):
+        async def rotation_task():
+            while True:
+                new_key = self.config_manager.rotate_auth_key()
+                await self.broadcast_auth_key(new_key)
+                logger.info(f"Rotated and broadcasted new auth key: {new_key[:8]}...")
+                await asyncio.sleep(interval)
+        asyncio.run_coroutine_threadsafe(rotation_task(), self.loop)
+
+    async def discover_peers(self):
+        bootstrap_nodes = self.config_manager.get_config("network", "bootstrap_nodes")
+        for node in bootstrap_nodes:
+            host, port = node.split(":")
+            url = f"https://{host}:{port}/get_peers"
+            success, peer_data = await self.send_with_retry(url, {}, method="get")
+            if success:
+                for peer_id, (peer_host, peer_port, pub_key) in peer_data.items():
+                    self.add_peer(peer_id, peer_host, int(peer_port), self.config_manager.get_secret("auth_key"), pub_key)
+                logger.info(f"Discovered peers from {host}:{port}")
+                break
+            else:
+                logger.warning(f"Failed to discover peers from {host}:{port}")
+
+    async def get_peers(self, request: aiohttp.web.Request) -> aiohttp.web.Response:
+        return aiohttp.web.json_response({peer_id: (host, port, pub_key) for peer_id, (host, port, pub_key) in self.peers.items()})
 
 class BlockchainGUI:
-    def __init__(self, blockchain: Blockchain, network: BlockchainNetwork, wallet_file: str = "wallets.json"):
+    def __init__(self, blockchain: Blockchain, network: BlockchainNetwork):
         self.blockchain = blockchain
         self.network = network
         self.wallets = {}
-        self.wallet_file = wallet_file
+        self.wallet_path = config_manager.get_config("storage", "wallet_path")
         self.miner = Miner(blockchain, blockchain.mempool, None)
         self.load_wallets()
         self.update_queue = Queue()
@@ -885,7 +1209,7 @@ class BlockchainGUI:
         status_frame.grid_columnconfigure(0, weight=1)
         status_frame.grid_columnconfigure(1, weight=1)
         self.main_frame.grid_rowconfigure(5, weight=1)
-        self.update_peer_list()  # Moved to after all widgets are created
+        self.update_peer_list()
 
     def create_transaction_history(self):
         history_frame = ttk.LabelFrame(self.main_frame, text="Transaction History", padding=10)
@@ -902,25 +1226,28 @@ class BlockchainGUI:
 
     def load_wallets(self):
         try:
-            with open(self.wallet_file, 'r') as f:
-                data = json.load(f)
-                key, salt = data["key"], bytes.fromhex(data["salt"])
-                cipher = Fernet(key)
-                self.wallets = {name: {**w, "private_key": cipher.decrypt(w["private_key"].encode()).decode()}
-                                for name, w in data["wallets"].items()}
-        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+            with open(self.wallet_path, 'rb') as f:
+                encrypted_data = f.read()
+            password = tkinter.simpledialog.askstring("Password", "Enter wallet password:", show='*', parent=self.root)
+            if not password:
+                raise ValueError("Password required")
+            salt = encrypted_data[:16]
+            encrypted_wallet_data = encrypted_data[16:]
+            self.wallets = config_manager.decrypt_wallet_data(encrypted_wallet_data, salt, password)
+        except FileNotFoundError:
+            self.wallets = {}
+        except Exception as e:
+            logger.error(f"Error loading wallets: {e}")
             self.wallets = {}
 
     def save_wallets(self):
         password = tkinter.simpledialog.askstring("Password", "Enter wallet password:", show='*', parent=self.root)
         if not password:
             return
-        key, salt = derive_key(password)
-        cipher = Fernet(key)
-        encrypted_wallets = {name: {**w, "private_key": cipher.encrypt(w["private_key"].encode()).decode()}
-                             for name, w in self.wallets.items()}
-        with open(self.wallet_file, 'w') as f:
-            json.dump({"key": key.decode(), "salt": salt.hex(), "wallets": encrypted_wallets}, f)
+        encrypted_data, salt = config_manager.encrypt_wallet_data(self.wallets, password)
+        with open(self.wallet_path, 'wb') as f:
+            f.write(salt)
+            f.write(encrypted_data)
         self.update_wallet_dropdown()
 
     def update_wallet_dropdown(self):
@@ -956,12 +1283,12 @@ class BlockchainGUI:
         name = self.wallet_entry.get().strip()
         if name and name in self.wallets:
             balance = self.blockchain.get_balance(self.wallets[name]["address"])
-            self.balance_label.config(text=f"Balance: {balance}")
+            self.balance_label.config(text=f"Balance: {balance:.8f}")
 
     def create_wallet(self):
-        name = tkinter.simpledialog.askstring("Input", "Enter wallet name (alphanumeric only):", parent=self.root)
-        if not name or not name.isalnum() or any(n.lower() == name.lower() for n in self.wallets):
-            messagebox.showerror("Error", "Wallet name must be unique and alphanumeric")
+        name = tkinter.simpledialog.askstring("Input", "Enter wallet name (alphanumeric, 3-20 chars):", parent=self.root)
+        if not name or not re.match(r'^[a-zA-Z0-9]{3,20}$', name) or any(n.lower() == name.lower() for n in self.wallets):
+            messagebox.showerror("Error", "Wallet name must be unique, 3-20 alphanumeric characters")
             return
         wallet = generate_wallet()
         self.wallets[name] = wallet
@@ -982,15 +1309,15 @@ class BlockchainGUI:
             messagebox.showerror("Error", "Port must be between 1 and 65535")
             return
         peer_id = f"node{port}"
-        self.network.add_peer(peer_id, host, port, "some_shared_secret")
+        auth_key = config_manager.get_secret("auth_key")
+        self.network.add_peer(peer_id, host, port, auth_key, self.network.public_key_str)
         self.update_peer_list()
 
     def update_peer_list(self):
         self.peer_listbox.delete(0, tk.END)
-        for peer_id, (host, port) in self.network.peers.items():
+        for peer_id, (host, port, _) in self.network.peers.items():
             self.peer_listbox.insert(tk.END, f"{peer_id}: {host}:{port}")
         self.network_stats_label.config(text=f"Peers: {len(self.network.peers)}")
-        PEER_COUNT.set(len(self.network.peers))
 
     def start_mining(self):
         name = self.wallet_entry.get().strip()
@@ -1026,7 +1353,7 @@ class BlockchainGUI:
                 self.output.insert(tk.END, f"Transaction sent: {tx.tx_id[:8]}\n")
             else:
                 balance = self.blockchain.get_balance(wallet["address"])
-                messagebox.showerror("Error", f"Insufficient funds. Balance: {balance}, Required: {amount + 0.001}")
+                messagebox.showerror("Error", f"Insufficient funds. Balance: {balance:.8f}, Required: {amount + 0.001:.8f}")
         except ValueError as e:
             messagebox.showerror("Error", f"Invalid amount: {e}")
 
@@ -1052,7 +1379,7 @@ class BlockchainGUI:
                 if any(t.tx_id == tx.tx_id for t in block.transactions):
                     status = "Confirmed"
                     break
-            self.mempool_text.insert(tk.END, f"{tx.tx_id[:8]}: {status} - {tx.outputs[0].amount} to {tx.outputs[0].recipient[:8]}\n")
+            self.mempool_text.insert(tk.END, f"{tx.tx_id[:8]}: {status} - {tx.outputs[0].amount:.8f} to {tx.outputs[0].recipient[:8]}\n")
         name = self.wallet_entry.get().strip()
         if name in self.wallets:
             address = self.wallets[name]["address"]
@@ -1061,23 +1388,18 @@ class BlockchainGUI:
                 for tx in block.transactions:
                     if (tx.tx_type != TransactionType.COINBASE and any(i.public_key and SecurityUtils.public_key_to_address(i.public_key) == address for i in tx.inputs)) or any(o.recipient == address for o in tx.outputs):
                         direction = "Sent" if any(i.public_key and SecurityUtils.public_key_to_address(i.public_key) == address for i in tx.inputs) else "Received"
-                        self.history_text.insert(tk.END, f"{tx.tx_id[:8]}: {direction} {tx.outputs[0].amount} at {time.ctime(block.header.timestamp)}\n")
+                        self.history_text.insert(tk.END, f"{tx.tx_id[:8]}: {direction} {tx.outputs[0].amount:.8f} at {time.ctime(block.header.timestamp)}\n")
         self.root.after(1000, self.update_ui)
 
     def exit(self):
         self.miner.stop_mining()
+        self.network.shutdown()
         self.root.quit()
+        logger.info("GUI shut down")
 
     def run(self):
         self.update_wallet_dropdown()
         self.root.mainloop()
-
-def derive_key(password: str, salt: bytes = None) -> tuple[bytes, bytes]:
-    if not salt:
-        salt = os.urandom(16)
-    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100000)
-    key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
-    return key, salt
 
 def is_port_available(port, host='localhost'):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -1089,7 +1411,20 @@ def find_available_port(start_port=1024, end_port=65535, host='localhost'):
         port = random.randint(start_port, end_port)
     return port
 
-if __name__ == "__main__":
+import argparse
+def main():
+    parser = argparse.ArgumentParser(description="OriginalCoin Node")
+    parser.add_argument("--port", type=int, help="Network port")
+    parser.add_argument("--host", default="127.0.0.1", help="Network host")
+    parser.add_argument("--config", help="Path to config file")
+    args = parser.parse_args()
+
+    port = args.port or int(os.environ.get("ORIGINALCOIN_NETWORK_PORT", find_available_port()))
+    host = args.host
+    if args.config:
+        config_manager.config_file = Path(args.config)
+        config_manager._load_or_create_config()
+
     def run_prometheus():
         try:
             logger.info("Starting Prometheus metrics server on port 8000")
@@ -1100,15 +1435,24 @@ if __name__ == "__main__":
 
     prometheus_thread = threading.Thread(target=run_prometheus, daemon=True)
     prometheus_thread.start()
-    time.sleep(1)  # Give Prometheus a moment to start
-    port = find_available_port()
+    time.sleep(1)
+    
+    port = int(os.environ.get("ORIGINALCOIN_NETWORK_PORT", find_available_port()))
     node_id = f"node{port}"
-    logger.info(f"Starting node {node_id} on port {port}")  # Log the port
+    logger.info(f"Starting node {node_id} on port {port}")
+    
     blockchain = Blockchain()
-    network = BlockchainNetwork(blockchain, node_id, "127.0.0.1", port)
+    network = BlockchainNetwork(blockchain, f"node{port}", host, port)
     network_thread = threading.Thread(target=network.run)
     network_thread.daemon = True
     network_thread.start()
+    
     network.start_periodic_sync()
+    network.start_key_rotation()
+    asyncio.run_coroutine_threadsafe(network.discover_peers(), network.loop)
+    
     gui = BlockchainGUI(blockchain, network)
     gui.run()
+
+    if __name__ == "__main__":
+        main()
