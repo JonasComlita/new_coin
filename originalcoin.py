@@ -11,6 +11,8 @@ import ecdsa
 import os
 import base64
 import ssl
+import re
+import psycopg2  # Add this
 from typing import List, Dict, Optional, Any, Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -35,7 +37,6 @@ import getpass
 from acme import client, messages, challenges
 from josepy import JWKRSA
 from pathlib import Path
-import sqlite3
 
 # Configure logging with rotation
 handler = logging.handlers.RotatingFileHandler("originalcoin.log", maxBytes=5*1024*1024, backupCount=3)
@@ -178,8 +179,8 @@ class SecureConfigManager:
             .issuer_name(issuer)
             .public_key(public_key)
             .serial_number(x509.random_serial_number())
-            .not_valid_before(datetime.utcnow())
-            .not_valid_after(datetime.utcnow() + timedelta(days=self.get_config("security", "cert_validity_days")))
+            .not_valid_before(datetime.now())
+            .not_valid_after(datetime.now() + timedelta(days=self.get_config("security", "cert_validity_days")))
             .add_extension(x509.SubjectAlternativeName([x509.DNSName(self.get_config("security", "domain"))]), critical=False)
             .sign(private_key, hashes.SHA256())
         )
@@ -243,7 +244,7 @@ class SecureConfigManager:
         try:
             with open(self.cert_file, "rb") as f:
                 cert = x509.load_pem_x509_certificate(f.read())
-            return cert.not_valid_after < datetime.utcnow()
+            return cert.not_valid_after_utc < datetime.now()
         except Exception:
             return True
 
@@ -606,16 +607,15 @@ class Miner:
         )
 
 class Blockchain:
-    def __init__(self, storage_path: str = None):
+    def __init__(self, db_config: dict = None):
         self.chain: List[Block] = []
-        self.storage_path = storage_path or config_manager.get_config("storage", "blockchain_path")
-        self.chain = []
-        self.db = sqlite3.connect(self.storage_path)
-        self.db.execute('''CREATE TABLE IF NOT EXISTS blocks (
-                            index INTEGER PRIMARY KEY,
-                            data TEXT NOT NULL
-                        )''')
-        self.load_chain()
+        self.db_config = db_config or {
+            "dbname": "originalcoin",
+            "user": "postgres",
+            "password": os.environ.get("PG_PASSWORD", "yourpassword"),
+            "host": "localhost",
+            "port": "5432"
+        }
         self.difficulty = config_manager.get_config("blockchain", "difficulty")
         self.current_reward = config_manager.get_config("blockchain", "initial_reward")
         self.halving_interval = config_manager.get_config("blockchain", "halving_interval")
@@ -624,7 +624,18 @@ class Blockchain:
         self.orphans: Dict[str, Block] = {}
         self.lock = threading.Lock()
         self.listeners = {"new_block": [], "new_transaction": []}
+        self.db = psycopg2.connect(**self.db_config)
+        self.initialize_db()
         self.load_chain()
+
+    def initialize_db(self):
+        with self.db.cursor() as cur:
+            cur.execute('''CREATE TABLE IF NOT EXISTS blocks (
+                            index INTEGER PRIMARY KEY,
+                            data JSONB NOT NULL
+                        )''')
+            self.db.commit()
+        logger.info("Database initialized")
 
     def subscribe(self, event: str, callback: Callable) -> None:
         if event in self.listeners:
@@ -634,20 +645,35 @@ class Blockchain:
         for callback in self.listeners[event]:
             callback(data)
 
-    def load_chain(self):
-        cursor = self.db.execute("SELECT data FROM blocks ORDER BY index")
-        self.chain = [Block.from_dict(json.loads(row[0])) for row in cursor.fetchall()]
-        if not self.chain:
-            genesis_block = Block(index=0, transactions=[], previous_hash="0" * 64, difficulty=self.difficulty)
-            self.chain.append(genesis_block)
-            self.save_chain()
-
-    def save_chain(self):
-        with self.lock:
-            self.db.execute("DELETE FROM blocks")
+    def load_chain(self) -> None:
+        try:
+            with self.db.cursor() as cur:
+                cur.execute("SELECT data FROM blocks ORDER BY index")
+                rows = cur.fetchall()
+                if rows:
+                    self.chain = [Block.from_dict(row[0]) for row in rows]
+                else:
+                    genesis_block = Block(index=0, transactions=[], previous_hash="0" * 64, difficulty=self.difficulty)
+                    self.chain.append(genesis_block)
+                    self.save_chain()
             for block in self.chain:
-                self.db.execute("INSERT INTO blocks (index, data) VALUES (?, ?)", (block.index, json.dumps(block.to_dict())))
-            self.db.commit()
+                self.utxo_set.update_with_block(block)
+        except psycopg2.Error as e:
+            logger.error(f"Failed to load chain: {e}")
+            raise
+
+    def save_chain(self) -> None:
+        with self.lock:
+            try:
+                with self.db.cursor() as cur:
+                    cur.execute("DELETE FROM blocks")
+                    for block in self.chain:
+                        cur.execute("INSERT INTO blocks (index, data) VALUES (%s, %s)", (block.index, json.dumps(block.to_dict())))
+                    self.db.commit()
+            except psycopg2.Error as e:
+                logger.error(f"Failed to save chain: {e}")
+                self.db.rollback()
+                raise
 
     async def validate_block(self, block: Block) -> bool:
         if block.index > 0:
@@ -1425,6 +1451,27 @@ def main():
         config_manager.config_file = Path(args.config)
         config_manager._load_or_create_config()
 
+    db_config = {
+        "dbname": "originalcoin",
+        "user": "postgres",
+        "password": os.environ.get("PG_PASSWORD", "yourpassword"),
+        "host": "postgres" if os.environ.get("DOCKERIZED", "false") == "true" else "localhost",
+        "port": "5432"
+    }
+    blockchain = Blockchain(db_config)
+    network = BlockchainNetwork(blockchain, f"node{port}", host, port)
+    network_thread = threading.Thread(target=network.run)
+    network_thread.daemon = True
+    network_thread.start()
+
+    network.start_periodic_sync()
+    network.start_key_rotation()
+    asyncio.run_coroutine_threadsafe(network.discover_peers(), network.loop)
+
+    gui = BlockchainGUI(blockchain, network)
+    gui.run()
+
+if __name__ == "__main__":
     def run_prometheus():
         try:
             logger.info("Starting Prometheus metrics server on port 8000")
@@ -1436,23 +1483,4 @@ def main():
     prometheus_thread = threading.Thread(target=run_prometheus, daemon=True)
     prometheus_thread.start()
     time.sleep(1)
-    
-    port = int(os.environ.get("ORIGINALCOIN_NETWORK_PORT", find_available_port()))
-    node_id = f"node{port}"
-    logger.info(f"Starting node {node_id} on port {port}")
-    
-    blockchain = Blockchain()
-    network = BlockchainNetwork(blockchain, f"node{port}", host, port)
-    network_thread = threading.Thread(target=network.run)
-    network_thread.daemon = True
-    network_thread.start()
-    
-    network.start_periodic_sync()
-    network.start_key_rotation()
-    asyncio.run_coroutine_threadsafe(network.discover_peers(), network.loop)
-    
-    gui = BlockchainGUI(blockchain, network)
-    gui.run()
-
-    if __name__ == "__main__":
-        main()
+    main()
