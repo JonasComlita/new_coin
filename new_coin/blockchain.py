@@ -109,6 +109,18 @@ class BlockHeader:
             "nonce": self.nonce,
             "hash": self.hash
         }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'BlockHeader':
+        """Create a BlockHeader instance from a dictionary."""
+        return cls(
+            index=data["index"],
+            previous_hash=data["previous_hash"],
+            timestamp=data["timestamp"],
+            difficulty=data["difficulty"],
+            nonce=data["nonce"],
+            hash=data["hash"]
+        )
 
 def calculate_merkle_root(transactions: List[Transaction]) -> str:
     tx_ids = [tx.tx_id for tx in transactions]
@@ -625,7 +637,7 @@ class Blockchain:
         for peer_id, (host, port) in self.network.peers.items():
             try:
                 async with aiohttp.ClientSession() as session:
-                    url = f"http://{host}:{port}/get_chain"
+                    url = f"https://{host}:{port}/get_chain"
                     async with session.get(url) as response:
                         if response.status == 200:
                             chain_data = await response.json()

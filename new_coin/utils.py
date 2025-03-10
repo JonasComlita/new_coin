@@ -14,11 +14,10 @@ from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
-PEER_AUTH_SECRET = os.getenv("PEER_AUTH_SECRET", os.urandom(32).hex())  # Default to random if not set
+PEER_AUTH_SECRET = os.getenv("PEER_AUTH_SECRET", os.urandom(32).hex())
 SSL_CERT_PATH = os.getenv("SSL_CERT_PATH", "server.crt")
 SSL_KEY_PATH = os.getenv("SSL_KEY_PATH", "server.key")
 
-# Generate self-signed cert if not provided (for demo purposes)
 if not os.path.exists(SSL_CERT_PATH) or not os.path.exists(SSL_KEY_PATH):
     result = os.system(f'openssl req -x509 -newkey rsa:2048 -keyout "{SSL_KEY_PATH}" -out "{SSL_CERT_PATH}" -days 365 -nodes -subj "/CN=localhost"')
     if result != 0:

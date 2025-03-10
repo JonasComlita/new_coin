@@ -50,6 +50,7 @@ class BlockchainNetwork:
         self.blockchain.network = self
         self.ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         self.ssl_context.load_cert_chain(SSL_CERT_PATH, SSL_KEY_PATH)
+        self.sync_task = None
 
     def add_peer(self, peer_id: str, host: str, port: int, auth_key: str = None):
             if auth_key != PEER_AUTH_SECRET:
@@ -59,35 +60,42 @@ class BlockchainNetwork:
             return True
 
     def run(self) -> None:
+        logger.info(f"Setting up network server on {self.host}:{self.port}")
         runner = aiohttp.web.AppRunner(self.app)
         self.loop.run_until_complete(runner.setup())
         site = aiohttp.web.TCPSite(runner, self.host, self.port, ssl_context=self.ssl_context)
         self.loop.run_until_complete(site.start())
+        logger.info(f"Network server running on {self.host}:{self.port}")
         self.loop.run_forever()
 
     async def send_with_retry(self, url: str, data: dict, method: str = "post", max_retries: int = CONFIG["max_retries"]):
         headers = {"Authorization": f"Bearer {PEER_AUTH_SECRET}"}
+        client_ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        client_ssl_context.check_hostname = False
+        client_ssl_context.verify_mode = ssl.CERT_NONE
         for attempt in range(max_retries):
             try:
                 async with aiohttp.ClientSession() as session:
                     if method == "post":
-                        async with session.post(url, json=data, headers=headers, ssl=self.ssl_context, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                        async with session.post(url, json=data, headers=headers, ssl=client_ssl_context, timeout=aiohttp.ClientTimeout(total=5)) as response:
                             return response.status == 200
                     elif method == "get":
-                        async with session.get(url, headers=headers, ssl=self.ssl_context, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                        async with session.get(url, headers=headers, ssl=client_ssl_context, timeout=aiohttp.ClientTimeout(total=5)) as response:
                             return response.status == 200, await response.json()
-            except aiohttp.ClientConnectorError as e:
-                logger.error(f"Connection error to {url}: {e}")
-                if attempt == max_retries - 1:
-                    return False if method == "post" else (False, None)
-            except aiohttp.ClientSSLError as e:
-                logger.error(f"SSL error: {e}")
-                return False if method == "post" else (False, None)
             except Exception as e:
-                logger.error(f"Unexpected error: {e}")
+                logger.error(f"Connection error to {url} (attempt {attempt + 1}/{max_retries}): {e}")
                 if attempt == max_retries - 1:
                     return False if method == "post" else (False, None)
-            await asyncio.sleep(0.5 * (2 ** attempt))
+                await asyncio.sleep(0.5 * (2 ** attempt))
+
+    async def send_block(self, peer_id: str, host: str, port: int, block: Block) -> None:
+        url = f"https://{host}:{port}/receive_block"
+        data = {"block": block.to_dict()}
+        success = await self.send_with_retry(url, data)
+        if success:
+            logger.info(f"Sent block {block.index} to {peer_id}")
+        else:
+            logger.warning(f"Failed to send block {block.index} to {peer_id}")
 
     async def receive_block(self, request: aiohttp.web.Request) -> aiohttp.web.Response:
         if request.headers.get("Authorization") != f"Bearer {PEER_AUTH_SECRET}":
@@ -109,22 +117,13 @@ class BlockchainNetwork:
             url = f"https://{host}:{port}/receive_transaction"
             await self.send_with_retry(url, {"transaction": tx.to_dict()})
 
-    async def send_block(self, peer_id: str, host: str, port: int, block: Block) -> None:
-        url = f"http://{host}:{port}/receive_block"
-        data = {"block": block.to_dict()}
-        success = await self.send_with_retry(url, data)
-        if success:
-            logger.info(f"Sent block {block.index} to {peer_id}")
-        else:
-            logger.warning(f"Failed to send block {block.index} to {peer_id}")
-
     async def broadcast_transaction(self, tx: Transaction) -> None:
         tasks = [self.send_transaction(peer_id, host, port, tx) for peer_id, (host, port) in self.peers.items() if peer_id != self.node_id]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def send_transaction(self, peer_id: str, host: str, port: int, tx: Transaction) -> None:
-        url = f"http://{host}:{port}/receive_transaction"
+        url = f"https://{host}:{port}/receive_transaction"
         data = {"transaction": tx.to_dict()}
         success = await self.send_with_retry(url, data)
         if not success:
@@ -158,12 +157,13 @@ class BlockchainNetwork:
         return aiohttp.web.Response(status=200)
 
     async def broadcast_peer_announcement(self):
-        data = {"node_id": self.node_id, "host": self.host, "port": self.port}
-        for peer_id, (host, port) in list(self.peers.items()):
+        logger.info("Broadcasting peer announcement")
+        for peer_id, (host, port) in self.peers.copy().items():
             url = f"https://{host}:{port}/announce_peer"
-            if not await self.send_with_retry(url, data):
-                logger.warning(f"Failed to announce to {peer_id}, removing")
-                del self.peers[peer_id]
+            data = {"host": self.host, "port": self.port, "peer_id": self.node_id}
+            success = await self.send_with_retry(url, data, method="post")
+            if not success:
+                logger.warning(f"Failed to announce to {peer_id}")
 
     async def discover_peers(self):
         data = {"node_id": self.node_id, "host": self.host, "port": self.port}
@@ -174,19 +174,30 @@ class BlockchainNetwork:
                 logger.info(f"Connected to bootstrap node at {host}:{port}")
 
     def start_periodic_sync(self):
+        """Return the sync loop coroutine for external scheduling."""
         async def sync_loop():
-            await self.discover_peers()  # Initial discovery
+            logger.info("Starting periodic sync loop")
+            await self.discover_peers()
+            logger.info("Initial peer discovery completed")
             while True:
+                logger.info("Sync loop iteration starting")
                 await self.request_chain()
                 await self.broadcast_peer_announcement()
+                logger.info("Sync loop iteration completed")
                 await asyncio.sleep(CONFIG["sync_interval"])
-        asyncio.run_coroutine_threadsafe(sync_loop(), self.loop)
+        # Schedule the task internally and store it
+        self.sync_task = self.loop.create_task(sync_loop())
+        return sync_loop()  # Return the coroutine
 
     async def request_chain(self):
-        if self.peers:
-            peer_id, (host, port) = next(iter(self.peers.items()))
-            url = f"https://{host}:{port}/get_chain"
-            success, data = await self.send_with_retry(url, {}, method="get")
-            if success and data:
-                new_chain = [Block.from_dict(b) for b in data["chain"]]
-                self.blockchain.validate_and_replace_chain(new_chain)
+        logger.info("Requesting chain from peers")
+        for peer_id, (host, port) in self.peers.copy().items():
+            success, chain_data = await self.send_with_retry(
+                f"https://{host}:{port}/get_chain", {}, method="get"
+            )
+            if success and chain_data:
+                logger.info(f"Received chain from {peer_id}: {len(chain_data['chain'])} blocks")
+                peer_chain = [Block.from_dict(block) for block in chain_data["chain"]]
+                self.blockchain.resolve_conflicts(peer_chain)
+            else:
+                logger.warning(f"Failed to get chain from {peer_id}")
