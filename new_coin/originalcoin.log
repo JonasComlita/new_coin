@@ -1,0 +1,25 @@
+INFO:Blockchain:Starting Prometheus metrics server on port 8000
+INFO:Blockchain:Prometheus server started
+INFO:Blockchain:Starting Prometheus metrics server on port 8000
+INFO:Blockchain:Prometheus server started
+INFO:Blockchain:Starting Prometheus metrics server on port 8000
+INFO:Blockchain:Prometheus server started
+INFO:Blockchain:Starting Prometheus metrics server on port 8000
+INFO:Blockchain:Prometheus server started
+INFO:Blockchain:Starting Prometheus metrics server on port 8000
+INFO:Blockchain:Prometheus server started
+INFO:Blockchain:Starting Prometheus metrics server on port 8000
+INFO:Blockchain:Prometheus server started
+ERROR:Blockchain:Health check failed, exiting...
+INFO:Blockchain:Starting Prometheus metrics server on port 8000
+INFO:Blockchain:Prometheus server started
+INFO:Blockchain:Starting Prometheus metrics server on port 8000
+INFO:Blockchain:Prometheus server started
+ERROR:Blockchain:Health check failed, exiting...
+INFO:Blockchain:Starting Prometheus metrics server on port 8000
+INFO:Blockchain:Prometheus server started
+INFO:Blockchain:Initializing blockchain and network on port 14680
+INFO:Blockchain:Starting network thread
+INFO:Blockchain:Network thread started
+ERROR:Blockchain:Health check failed: Cannot connect to host 127.0.0.1:14680 ssl:<ssl.SSLContext object at 0x000001B9812E3800> [Cannot create a client socket with a PROTOCOL_TLS_SERVER context (_ssl.c:826)]
+ERROR:Blockchain:Health check failed, exiting...

@@ -1,0 +1,15 @@
+services:
+  blockchain:
+    build: .
+    ports:
+      - "8000:8000" # Prometheus
+      - "1024-65535:1024-65535" # Dynamic port range
+    volumes:
+      - ./chain.db:/app/chain.db
+      - ./originalcoin.log:/app/originalcoin.log
+      - ./wallets.json:/app/wallets.json
+      - ./config.yaml:/app/config.yaml
+    environment:
+      - PEER_AUTH_SECRET=${PEER_AUTH_SECRET}
+      - SSL_CERT_PATH=/app/server.crt
+      - SSL_KEY_PATH=/app/server.key
