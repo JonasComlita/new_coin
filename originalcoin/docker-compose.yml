@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "8443:8443"
+      - "8000:8000"
+    volumes:
+      - C:/Users/jdman/.originalcoin:/root/.originalcoin
+    environment:
+      - ORIGINALCOIN_NETWORK_PORT=8443
+      - ORIGINALCOIN_DOMAIN=localhost
+      - ORIGINALCOIN_USE_ACME=false
+      - PG_PASSWORD=yourpassword
+      - DOCKERIZED=true
+    depends_on:
+      - postgres
+    networks:
+      - originalcoin-net
+
+  postgres:
+    image: postgres:16
+    environment:
+      - POSTGRES_DB=originalcoin
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=yourpassword
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - originalcoin-net
+
+volumes:
+  pgdata:
+
+
+networks:
+  originalcoin-net:
+    driver: bridge

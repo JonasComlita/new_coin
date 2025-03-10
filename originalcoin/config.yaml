@@ -1,0 +1,7 @@
+difficulty: 6
+target_block_time: 60
+current_reward: 20.0
+halving_interval: 210000
+mempool_max_size: 5000
+sync_interval: 10
+max_retries: 3

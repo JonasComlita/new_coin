@@ -1,0 +1,8 @@
+aiohttp
+cryptography
+ecdsa
+prometheus_client
+python-dotenv
+acme
+josepy
+psycopg2-binary
