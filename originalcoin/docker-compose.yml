@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   app:
     build: .
@@ -12,30 +10,27 @@ services:
       - ORIGINALCOIN_NETWORK_PORT=8443
       - ORIGINALCOIN_DOMAIN=localhost
       - ORIGINALCOIN_USE_ACME=false
-      - PG_PASSWORD=yourpassword
+      - PG_PASSWORD=+Pw=fku123!
       - DOCKERIZED=true
+      - PYTHONUNBUFFERED=1 # Force unbuffered output
+    command: [ "python", "-u", "originalcoin.py", "--host", "0.0.0.0" ] # -u for unbuffered
     depends_on:
       - postgres
     networks:
       - originalcoin-net
-
   postgres:
-    image: postgres:16
+    image: postgres:latest
+    volumes:
+      - pgdata:/var/lib/postgresql/data
     environment:
       - POSTGRES_DB=originalcoin
       - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=yourpassword
-    volumes:
-      - pgdata:/var/lib/postgresql/data
+      - POSTGRES_PASSWORD=+Pw=fku123!
     ports:
       - "5432:5432"
     networks:
       - originalcoin-net
-
-volumes:
-  pgdata:
-
-
 networks:
   originalcoin-net:
-    driver: bridge
+volumes:
+  pgdata:

@@ -1,0 +1,6 @@
+2025-03-09 18:29:23,571 - Blockchain - WARNING - No master key in environment; generated temporary key. Set ORIGINALCOIN_MASTER_KEY for persistence.
+2025-03-09 18:29:23,590 - Blockchain - INFO - Generated self-signed certificate at C:\Users\jdman\.originalcoin\cert.pem
+2025-03-09 18:29:25,647 - Blockchain - INFO - Initializing Blockchain
+2025-03-09 18:29:25,648 - Blockchain - INFO - Attempting to connect to database with config: {'dbname': 'originalcoin', 'user': 'postgres', 'password': '+Pw=fku123!', 'host': 'postgres', 'port': '5432'}
+2025-03-09 18:29:28,374 - Blockchain - ERROR - Database connection failed: could not translate host name "postgres" to address: Temporary failure in name resolution
+

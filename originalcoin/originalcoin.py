@@ -12,15 +12,12 @@ import os
 import base64
 import ssl
 import re
-import psycopg2  # Add this
+import argparse
+import psycopg2 
 from typing import List, Dict, Optional, Any, Callable
 from dataclasses import dataclass
 from enum import Enum
 from queue import Queue
-import tkinter as tk
-from tkinter import ttk
-from tkinter import messagebox, scrolledtext
-import tkinter.simpledialog
 import random
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
@@ -33,10 +30,10 @@ from datetime import datetime, timedelta
 import socket
 from prometheus_client import Counter, Gauge, start_http_server
 from dotenv import load_dotenv
-import getpass
-from acme import client, messages, challenges
+from acme import client, challenges
 from josepy import JWKRSA
 from pathlib import Path
+import time
 
 # Configure logging with rotation
 handler = logging.handlers.RotatingFileHandler("originalcoin.log", maxBytes=5*1024*1024, backupCount=3)
@@ -608,14 +605,22 @@ class Miner:
 
 class Blockchain:
     def __init__(self, db_config: dict = None):
+        logger.info("Initializing Blockchain")
         self.chain: List[Block] = []
         self.db_config = db_config or {
             "dbname": "originalcoin",
             "user": "postgres",
-            "password": os.environ.get("PG_PASSWORD", "yourpassword"),
-            "host": "localhost",
+            "password": os.environ.get("PG_PASSWORD", "+Pw=fku123!"),
+            "host": "originalcoin-postgres-1" if os.environ.get("DOCKERIZED", "false") == "true" else "localhost",
             "port": "5432"
         }
+        logger.info(f"Attempting to connect to database with config: {self.db_config}")
+        try:
+            self.db = psycopg2.connect(**self.db_config)
+        except psycopg2.Error as e:
+            logger.error(f"Database connection failed: {e}")
+            raise
+        logger.info("Database connection established")
         self.difficulty = config_manager.get_config("blockchain", "difficulty")
         self.current_reward = config_manager.get_config("blockchain", "initial_reward")
         self.halving_interval = config_manager.get_config("blockchain", "halving_interval")
@@ -1130,6 +1135,18 @@ class BlockchainNetwork:
 
 class BlockchainGUI:
     def __init__(self, blockchain: Blockchain, network: BlockchainNetwork):
+        try:
+            import tkinter as tk
+            from tkinter import ttk, scrolledtext, messagebox, simpledialog
+        except ImportError:
+            raise ImportError("Tkinter is required for GUI mode. Install it with 'pip install tk' or run in headless mode.")
+        
+        self.tk = tk  # Store tk module locally
+        self.ttk = ttk
+        self.scrolledtext = scrolledtext
+        self.messagebox = messagebox
+        self.simpledialog = simpledialog
+
         self.blockchain = blockchain
         self.network = network
         self.wallets = {}
@@ -1137,12 +1154,12 @@ class BlockchainGUI:
         self.miner = Miner(blockchain, blockchain.mempool, None)
         self.load_wallets()
         self.update_queue = Queue()
-        self.root = tk.Tk()
+        self.root = self.tk.Tk()
         self.root.title("OriginalCoin GUI")
         self.root.geometry("900x1000")
         self.root.grid_rowconfigure(0, weight=1)
         self.root.grid_columnconfigure(0, weight=1)
-        self.main_frame = ttk.Frame(self.root)
+        self.main_frame = self.ttk.Frame(self.root)
         self.main_frame.pack(fill='both', expand=True, padx=10, pady=10)
         self.create_header()
         self.create_wallet_section()
@@ -1157,80 +1174,81 @@ class BlockchainGUI:
         self.root.after(1000, self.update_ui)
         self.root.protocol("WM_DELETE_WINDOW", self.exit)
 
+    # Rest of BlockchainGUI methods remain unchanged
     def create_header(self):
-        header_frame = ttk.Frame(self.main_frame)
+        header_frame = self.ttk.Frame(self.main_frame)
         header_frame.grid(row=0, column=0, sticky='ew', pady=(0, 10))
-        ttk.Label(header_frame, text="OriginalCoin", font=("Arial", 24, "bold")).pack(fill='x')
+        self.ttk.Label(header_frame, text="OriginalCoin", font=("Arial", 24, "bold")).pack(fill='x')
         self.main_frame.grid_columnconfigure(0, weight=1)
 
     def create_wallet_section(self):
-        wallet_frame = ttk.LabelFrame(self.main_frame, text="Wallet", padding=10)
+        wallet_frame = self.ttk.LabelFrame(self.main_frame, text="Wallet", padding=10)
         wallet_frame.grid(row=1, column=0, sticky='ew', pady=5)
-        ttk.Label(wallet_frame, text="Wallet:").grid(row=0, column=0, sticky='w', padx=5)
-        self.wallet_entry = ttk.Entry(wallet_frame, width=20)
+        self.ttk.Label(wallet_frame, text="Wallet:").grid(row=0, column=0, sticky='w', padx=5)
+        self.wallet_entry = self.ttk.Entry(wallet_frame, width=20)
         self.wallet_entry.grid(row=0, column=1, sticky='ew', padx=5)
         self.wallet_entry.bind("<KeyRelease>", self.on_entry_change)
-        self.wallet_var = tk.StringVar(value="")
-        self.wallet_dropdown = ttk.OptionMenu(wallet_frame, self.wallet_var, "", *self.wallets.keys(), command=self.on_dropdown_select)
+        self.wallet_var = self.tk.StringVar(value="")
+        self.wallet_dropdown = self.ttk.OptionMenu(wallet_frame, self.wallet_var, "", *self.wallets.keys(), command=self.on_dropdown_select)
         self.wallet_dropdown.grid(row=0, column=2, sticky='ew', padx=5)
-        ttk.Button(wallet_frame, text="Create Wallet", command=self.create_wallet).grid(row=0, column=3, sticky='e', padx=5)
+        self.ttk.Button(wallet_frame, text="Create Wallet", command=self.create_wallet).grid(row=0, column=3, sticky='e', padx=5)
         wallet_frame.grid_columnconfigure(1, weight=1)
 
     def create_mining_section(self):
-        mining_frame = ttk.LabelFrame(self.main_frame, text="Mining Controls", padding=10)
+        mining_frame = self.ttk.LabelFrame(self.main_frame, text="Mining Controls", padding=10)
         mining_frame.grid(row=2, column=0, sticky='ew', pady=5)
-        ttk.Button(mining_frame, text="Mine", command=self.start_mining).grid(row=0, column=0, sticky='w', padx=5)
-        ttk.Button(mining_frame, text="Stop Mining", command=self.stop_mining).grid(row=0, column=1, sticky='e', padx=5)
+        self.ttk.Button(mining_frame, text="Mine", command=self.start_mining).grid(row=0, column=0, sticky='w', padx=5)
+        self.ttk.Button(mining_frame, text="Stop Mining", command=self.stop_mining).grid(row=0, column=1, sticky='e', padx=5)
         mining_frame.grid_columnconfigure(0, weight=1)
         mining_frame.grid_columnconfigure(1, weight=1)
 
     def create_transaction_section(self):
-        send_frame = ttk.LabelFrame(self.main_frame, text="Send Transaction", padding=10)
+        send_frame = self.ttk.LabelFrame(self.main_frame, text="Send Transaction", padding=10)
         send_frame.grid(row=3, column=0, sticky='ew', pady=5)
-        ttk.Label(send_frame, text="To Address:").grid(row=0, column=0, sticky='w', padx=5)
-        self.to_entry = ttk.Entry(send_frame, width=40)
+        self.ttk.Label(send_frame, text="To Address:").grid(row=0, column=0, sticky='w', padx=5)
+        self.to_entry = self.ttk.Entry(send_frame, width=40)
         self.to_entry.grid(row=0, column=1, sticky='ew', padx=5)
-        ttk.Label(send_frame, text="Amount:").grid(row=1, column=0, sticky='w', padx=5)
-        self.amount_entry = ttk.Entry(send_frame)
+        self.ttk.Label(send_frame, text="Amount:").grid(row=1, column=0, sticky='w', padx=5)
+        self.amount_entry = self.ttk.Entry(send_frame)
         self.amount_entry.grid(row=1, column=1, sticky='ew', padx=5)
-        ttk.Button(send_frame, text="Send", command=self.send_transaction).grid(row=1, column=2, sticky='e', padx=5)
+        self.ttk.Button(send_frame, text="Send", command=self.send_transaction).grid(row=1, column=2, sticky='e', padx=5)
         send_frame.grid_columnconfigure(1, weight=1)
 
     def create_peer_section(self):
-        peer_frame = ttk.LabelFrame(self.main_frame, text="Peer Management", padding=10)
+        peer_frame = self.ttk.LabelFrame(self.main_frame, text="Peer Management", padding=10)
         peer_frame.grid(row=4, column=0, sticky='ew', pady=5)
-        ttk.Label(peer_frame, text="Host:").grid(row=0, column=0, sticky='w', padx=5)
-        self.peer_host_entry = ttk.Entry(peer_frame)
+        self.ttk.Label(peer_frame, text="Host:").grid(row=0, column=0, sticky='w', padx=5)
+        self.peer_host_entry = self.ttk.Entry(peer_frame)
         self.peer_host_entry.grid(row=0, column=1, sticky='ew', padx=5)
         self.peer_host_entry.insert(0, "127.0.0.1")
-        ttk.Label(peer_frame, text="Port:").grid(row=1, column=0, sticky='w', padx=5)
-        self.peer_port_entry = ttk.Entry(peer_frame)
+        self.ttk.Label(peer_frame, text="Port:").grid(row=1, column=0, sticky='w', padx=5)
+        self.peer_port_entry = self.ttk.Entry(peer_frame)
         self.peer_port_entry.grid(row=1, column=1, sticky='ew', padx=5)
-        ttk.Button(peer_frame, text="Add Peer", command=self.add_peer).grid(row=1, column=2, sticky='e', padx=5)
+        self.ttk.Button(peer_frame, text="Add Peer", command=self.add_peer).grid(row=1, column=2, sticky='e', padx=5)
         peer_frame.grid_columnconfigure(1, weight=1)
 
     def create_status_panel(self):
-        status_frame = ttk.LabelFrame(self.main_frame, text="Status", padding=10)
+        status_frame = self.ttk.LabelFrame(self.main_frame, text="Status", padding=10)
         status_frame.grid(row=5, column=0, sticky='nsew', pady=5)
-        ttk.Label(status_frame, text="Connected Peers:").grid(row=0, column=0, sticky='w', padx=5)
-        peers_container = ttk.Frame(status_frame)
+        self.ttk.Label(status_frame, text="Connected Peers:").grid(row=0, column=0, sticky='w', padx=5)
+        peers_container = self.ttk.Frame(status_frame)
         peers_container.grid(row=1, column=0, columnspan=2, sticky='ew', pady=5)
-        self.peer_listbox = tk.Listbox(peers_container, height=3)
+        self.peer_listbox = self.tk.Listbox(peers_container, height=3)
         self.peer_listbox.pack(side='left', fill='x', expand=True)
-        scrollbar = ttk.Scrollbar(peers_container, orient='vertical', command=self.peer_listbox.yview)
+        scrollbar = self.ttk.Scrollbar(peers_container, orient='vertical', command=self.peer_listbox.yview)
         scrollbar.pack(side='right', fill='y')
         self.peer_listbox.config(yscrollcommand=scrollbar.set)
-        self.balance_label = ttk.Label(status_frame, text="Balance: 0.0")
+        self.balance_label = self.ttk.Label(status_frame, text="Balance: 0.0")
         self.balance_label.grid(row=2, column=0, sticky='w', padx=5, pady=5)
-        self.chain_height_label = ttk.Label(status_frame, text="Chain Height: 0")
+        self.chain_height_label = self.ttk.Label(status_frame, text="Chain Height: 0")
         self.chain_height_label.grid(row=2, column=1, sticky='e', padx=5, pady=5)
-        self.network_stats_label = ttk.Label(status_frame, text="Peers: 0")
+        self.network_stats_label = self.ttk.Label(status_frame, text="Peers: 0")
         self.network_stats_label.grid(row=3, column=0, sticky='w', padx=5, pady=5)
-        ttk.Label(status_frame, text="Logs:").grid(row=4, column=0, sticky='w', padx=5, pady=5)
-        self.output = scrolledtext.ScrolledText(status_frame, width=70, height=10)
+        self.ttk.Label(status_frame, text="Logs:").grid(row=4, column=0, sticky='w', padx=5, pady=5)
+        self.output = self.scrolledtext.ScrolledText(status_frame, width=70, height=10)
         self.output.grid(row=5, column=0, columnspan=2, sticky='nsew', padx=5, pady=5)
-        ttk.Label(status_frame, text="Mempool:").grid(row=6, column=0, sticky='w', padx=5, pady=5)
-        self.mempool_text = scrolledtext.ScrolledText(status_frame, width=70, height=3)
+        self.ttk.Label(status_frame, text="Mempool:").grid(row=6, column=0, sticky='w', padx=5, pady=5)
+        self.mempool_text = self.scrolledtext.ScrolledText(status_frame, width=70, height=3)
         self.mempool_text.grid(row=7, column=0, columnspan=2, sticky='nsew', padx=5, pady=5)
         status_frame.grid_columnconfigure(0, weight=1)
         status_frame.grid_columnconfigure(1, weight=1)
@@ -1238,23 +1256,23 @@ class BlockchainGUI:
         self.update_peer_list()
 
     def create_transaction_history(self):
-        history_frame = ttk.LabelFrame(self.main_frame, text="Transaction History", padding=10)
+        history_frame = self.ttk.LabelFrame(self.main_frame, text="Transaction History", padding=10)
         history_frame.grid(row=6, column=0, sticky='nsew', pady=5)
-        self.history_text = scrolledtext.ScrolledText(history_frame, width=70, height=5)
+        self.history_text = self.scrolledtext.ScrolledText(history_frame, width=70, height=5)
         self.history_text.grid(row=0, column=0, sticky='nsew')
         history_frame.grid_columnconfigure(0, weight=1)
         self.main_frame.grid_rowconfigure(6, weight=1)
 
     def create_footer(self):
-        bottom_frame = ttk.Frame(self.root)
+        bottom_frame = self.ttk.Frame(self.root)
         bottom_frame.pack(side='bottom', fill='x', pady=(0, 10))
-        ttk.Button(bottom_frame, text="Exit", command=self.exit).pack(side='right', padx=10)
+        self.ttk.Button(bottom_frame, text="Exit", command=self.exit).pack(side='right', padx=10)
 
     def load_wallets(self):
         try:
             with open(self.wallet_path, 'rb') as f:
                 encrypted_data = f.read()
-            password = tkinter.simpledialog.askstring("Password", "Enter wallet password:", show='*', parent=self.root)
+            password = self.simpledialog.askstring("Password", "Enter wallet password:", show='*', parent=self.root)
             if not password:
                 raise ValueError("Password required")
             salt = encrypted_data[:16]
@@ -1267,7 +1285,7 @@ class BlockchainGUI:
             self.wallets = {}
 
     def save_wallets(self):
-        password = tkinter.simpledialog.askstring("Password", "Enter wallet password:", show='*', parent=self.root)
+        password = self.simpledialog.askstring("Password", "Enter wallet password:", show='*', parent=self.root)
         if not password:
             return
         encrypted_data, salt = config_manager.encrypt_wallet_data(self.wallets, password)
@@ -1301,7 +1319,7 @@ class BlockchainGUI:
     def on_dropdown_select(self, *args):
         name = self.wallet_var.get()
         if name and name != "No wallets":
-            self.wallet_entry.delete(0, tk.END)
+            self.wallet_entry.delete(0, self.tk.END)
             self.wallet_entry.insert(0, name)
         self.update_balance()
 
@@ -1312,15 +1330,15 @@ class BlockchainGUI:
             self.balance_label.config(text=f"Balance: {balance:.8f}")
 
     def create_wallet(self):
-        name = tkinter.simpledialog.askstring("Input", "Enter wallet name (alphanumeric, 3-20 chars):", parent=self.root)
+        name = self.simpledialog.askstring("Input", "Enter wallet name (alphanumeric, 3-20 chars):", parent=self.root)
         if not name or not re.match(r'^[a-zA-Z0-9]{3,20}$', name) or any(n.lower() == name.lower() for n in self.wallets):
-            messagebox.showerror("Error", "Wallet name must be unique, 3-20 alphanumeric characters")
+            self.messagebox.showerror("Error", "Wallet name must be unique, 3-20 alphanumeric characters")
             return
         wallet = generate_wallet()
         self.wallets[name] = wallet
         self.save_wallets()
-        self.output.insert(tk.END, f"Created wallet '{name}': Address: {wallet['address']}\n")
-        self.wallet_entry.delete(0, tk.END)
+        self.output.insert(self.tk.END, f"Created wallet '{name}': Address: {wallet['address']}\n")
+        self.wallet_entry.delete(0, self.tk.END)
         self.wallet_entry.insert(0, name)
         self.update_balance()
 
@@ -1328,11 +1346,11 @@ class BlockchainGUI:
         host = self.peer_host_entry.get().strip()
         port_str = self.peer_port_entry.get().strip()
         if not host or not port_str or not port_str.isdigit():
-            messagebox.showerror("Error", "Host and port must be valid")
+            self.messagebox.showerror("Error", "Host and port must be valid")
             return
         port = int(port_str)
         if not (1 <= port <= 65535):
-            messagebox.showerror("Error", "Port must be between 1 and 65535")
+            self.messagebox.showerror("Error", "Port must be between 1 and 65535")
             return
         peer_id = f"node{port}"
         auth_key = config_manager.get_secret("auth_key")
@@ -1340,33 +1358,33 @@ class BlockchainGUI:
         self.update_peer_list()
 
     def update_peer_list(self):
-        self.peer_listbox.delete(0, tk.END)
+        self.peer_listbox.delete(0, self.tk.END)
         for peer_id, (host, port, _) in self.network.peers.items():
-            self.peer_listbox.insert(tk.END, f"{peer_id}: {host}:{port}")
+            self.peer_listbox.insert(self.tk.END, f"{peer_id}: {host}:{port}")
         self.network_stats_label.config(text=f"Peers: {len(self.network.peers)}")
 
     def start_mining(self):
         name = self.wallet_entry.get().strip()
         if not name or name not in self.wallets:
-            messagebox.showerror("Error", "Select a valid wallet")
+            self.messagebox.showerror("Error", "Select a valid wallet")
             return
         self.miner.wallet_address = self.wallets[name]["address"]
         self.miner.start_mining()
-        self.output.insert(tk.END, f"Mining started with wallet '{name}'\n")
+        self.output.insert(self.tk.END, f"Mining started with wallet '{name}'\n")
 
     def stop_mining(self):
         self.miner.stop_mining()
-        self.output.insert(tk.END, "Mining stopped\n")
+        self.output.insert(self.tk.END, "Mining stopped\n")
 
     def send_transaction(self):
         from_name = self.wallet_entry.get().strip()
         to_address = self.to_entry.get().strip()
         amount = self.amount_entry.get().strip()
         if not from_name or not to_address or not amount:
-            messagebox.showerror("Error", "Provide all fields")
+            self.messagebox.showerror("Error", "Provide all fields")
             return
         if from_name not in self.wallets:
-            messagebox.showerror("Error", f"Wallet '{from_name}' does not exist")
+            self.messagebox.showerror("Error", f"Wallet '{from_name}' does not exist")
             return
         try:
             amount = float(amount)
@@ -1376,12 +1394,12 @@ class BlockchainGUI:
             tx = self.blockchain.create_transaction(wallet["private_key"], wallet["address"], to_address, amount)
             if tx and self.blockchain.add_transaction_to_mempool(tx):
                 asyncio.run_coroutine_threadsafe(self.network.broadcast_transaction(tx), self.network.loop)
-                self.output.insert(tk.END, f"Transaction sent: {tx.tx_id[:8]}\n")
+                self.output.insert(self.tk.END, f"Transaction sent: {tx.tx_id[:8]}\n")
             else:
                 balance = self.blockchain.get_balance(wallet["address"])
-                messagebox.showerror("Error", f"Insufficient funds. Balance: {balance:.8f}, Required: {amount + 0.001:.8f}")
+                self.messagebox.showerror("Error", f"Insufficient funds. Balance: {balance:.8f}, Required: {amount + 0.001:.8f}")
         except ValueError as e:
-            messagebox.showerror("Error", f"Invalid amount: {e}")
+            self.messagebox.showerror("Error", f"Invalid amount: {e}")
 
     def on_new_block(self, block: Block):
         self.update_queue.put(("block", block))
@@ -1393,28 +1411,28 @@ class BlockchainGUI:
         while not self.update_queue.empty():
             event_type, data = self.update_queue.get()
             if event_type == "block":
-                self.output.insert(tk.END, f"New block mined: {data.index}\n")
+                self.output.insert(self.tk.END, f"New block mined: {data.index}\n")
                 self.chain_height_label.config(text=f"Chain Height: {len(self.blockchain.chain) - 1}")
                 self.update_balance()
             elif event_type == "transaction":
-                self.output.insert(tk.END, f"New transaction in mempool: {data.tx_id[:8]}\n")
-        self.mempool_text.delete(1.0, tk.END)
+                self.output.insert(self.tk.END, f"New transaction in mempool: {data.tx_id[:8]}\n")
+        self.mempool_text.delete(1.0, self.tk.END)
         for tx in self.blockchain.mempool.transactions.values():
             status = "Pending"
             for block in self.blockchain.chain[-6:]:
                 if any(t.tx_id == tx.tx_id for t in block.transactions):
                     status = "Confirmed"
                     break
-            self.mempool_text.insert(tk.END, f"{tx.tx_id[:8]}: {status} - {tx.outputs[0].amount:.8f} to {tx.outputs[0].recipient[:8]}\n")
+            self.mempool_text.insert(self.tk.END, f"{tx.tx_id[:8]}: {status} - {tx.outputs[0].amount:.8f} to {tx.outputs[0].recipient[:8]}\n")
         name = self.wallet_entry.get().strip()
         if name in self.wallets:
             address = self.wallets[name]["address"]
-            self.history_text.delete(1.0, tk.END)
+            self.history_text.delete(1.0, self.tk.END)
             for block in self.blockchain.chain:
                 for tx in block.transactions:
                     if (tx.tx_type != TransactionType.COINBASE and any(i.public_key and SecurityUtils.public_key_to_address(i.public_key) == address for i in tx.inputs)) or any(o.recipient == address for o in tx.outputs):
                         direction = "Sent" if any(i.public_key and SecurityUtils.public_key_to_address(i.public_key) == address for i in tx.inputs) else "Received"
-                        self.history_text.insert(tk.END, f"{tx.tx_id[:8]}: {direction} {tx.outputs[0].amount:.8f} at {time.ctime(block.header.timestamp)}\n")
+                        self.history_text.insert(self.tk.END, f"{tx.tx_id[:8]}: {direction} {tx.outputs[0].amount:.8f} at {time.ctime(block.header.timestamp)}\n")
         self.root.after(1000, self.update_ui)
 
     def exit(self):
@@ -1437,12 +1455,12 @@ def find_available_port(start_port=1024, end_port=65535, host='localhost'):
         port = random.randint(start_port, end_port)
     return port
 
-import argparse
 def main():
     parser = argparse.ArgumentParser(description="OriginalCoin Node")
     parser.add_argument("--port", type=int, help="Network port")
     parser.add_argument("--host", default="127.0.0.1", help="Network host")
     parser.add_argument("--config", help="Path to config file")
+    parser.add_argument("--gui", action="store_true", help="Run with GUI (non-Docker only)")
     args = parser.parse_args()
 
     port = args.port or int(os.environ.get("ORIGINALCOIN_NETWORK_PORT", find_available_port()))
@@ -1454,7 +1472,7 @@ def main():
     db_config = {
         "dbname": "originalcoin",
         "user": "postgres",
-        "password": os.environ.get("PG_PASSWORD", "yourpassword"),
+        "password": os.environ.get("PG_PASSWORD", "+Pw=fku123!"),
         "host": "postgres" if os.environ.get("DOCKERIZED", "false") == "true" else "localhost",
         "port": "5432"
     }
@@ -1468,19 +1486,17 @@ def main():
     network.start_key_rotation()
     asyncio.run_coroutine_threadsafe(network.discover_peers(), network.loop)
 
-    gui = BlockchainGUI(blockchain, network)
-    gui.run()
+    if args.gui and os.environ.get("DOCKERIZED", "false") != "true":
+        gui = BlockchainGUI(blockchain, network)
+        gui.run()
+    else:
+        logger.info(f"Blockchain node running on {host}:{port}")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Shutting down node")
+            network.shutdown()
 
 if __name__ == "__main__":
-    def run_prometheus():
-        try:
-            logger.info("Starting Prometheus metrics server on port 8000")
-            start_http_server(8000)
-            logger.info("Prometheus server running")
-        except Exception as e:
-            logger.error(f"Failed to start Prometheus server: {e}")
-
-    prometheus_thread = threading.Thread(target=run_prometheus, daemon=True)
-    prometheus_thread.start()
-    time.sleep(1)
     main()
