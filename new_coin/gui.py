@@ -218,7 +218,11 @@ class BlockchainGUI:
             messagebox.showerror("Error", "Port must be between 1 and 65535")
             return
         peer_id = f"node{port}"
-        success = asyncio.run_coroutine_threadsafe(self.network.add_peer(peer_id, host, port, PEER_AUTH_SECRET), self.network.loop).result()
+        # Call add_peer with PEER_AUTH_SECRET as the public_key parameter
+        success = asyncio.run_coroutine_threadsafe(
+            self.network.add_peer(peer_id, host, port, PEER_AUTH_SECRET), 
+            self.network.loop
+        ).result()
         if not success:
             messagebox.showerror("Error", f"Failed to add peer {peer_id}")
         else:
@@ -226,10 +230,11 @@ class BlockchainGUI:
 
     def update_peer_list(self):
         self.peer_listbox.delete(0, tk.END)
-        for peer_id, (host, port) in self.network.peers.items():
+        for peer_id, peer_data in self.network.peers.items():
+            host, port, public_key = peer_data  # Unpack all three values
             self.peer_listbox.insert(tk.END, f"{peer_id}: {host}:{port}")
         self.network_stats_label.config(text=f"Connected Peers: {len(self.network.peers)}")
-
+    
     def start_mining(self):
         name = self.wallet_entry.get().strip()
         if not name or name not in self.wallets:

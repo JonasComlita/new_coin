@@ -3,68 +3,66 @@ import signal
 import sys
 import asyncio
 import ssl
+import argparse
+import logging
+import signal
+import sys
+import threading
 from blockchain import Blockchain
 from network import BlockchainNetwork
+from utils import find_available_port, init_rotation_manager, PEER_AUTH_SECRET
 from gui import BlockchainGUI
-from utils import find_available_port, PEER_AUTH_SECRET, SSL_CERT_PATH, SSL_KEY_PATH
-from prometheus_client import start_http_server
-import logging
-import aiohttp
-import argparse
 import os
-import yaml
+import aiohttp
+import logging
 
-handler = logging.StreamHandler(sys.stdout)
-handler.setLevel(logging.INFO)
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-handler.setFormatter(formatter)
-logger = logging.getLogger("Blockchain")
-logger.addHandler(handler)
-logger.setLevel(logging.INFO)
-
-# Load CONFIG from config.yaml
-with open("config.yaml", "r") as f:
-    CONFIG = yaml.safe_load(f)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 async def health_check(host: str, port: int, retries: int = 5, delay: float = 1.0) -> bool:
-    client_ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-    client_ssl_context.check_hostname = False
-    client_ssl_context.verify_mode = ssl.CERT_NONE
-    headers = {"Authorization": f"Bearer {PEER_AUTH_SECRET}"}
     for attempt in range(retries):
         try:
             async with aiohttp.ClientSession() as session:
-                url = f"https://{host}:{port}/get_chain"
-                logger.info(f"Attempting health check {attempt + 1}/{retries} on {url}")
-                async with session.get(url, headers=headers, ssl=False) as resp:
-                    logger.info(f"Health check response: {resp.status}")
-                    return resp.status == 200
+                async with session.get(f"https://{host}:{port}/health", ssl=network.client_ssl_context) as resp:
+                    if resp.status == 200:
+                        return True
         except Exception as e:
-            logger.warning(f"Health check attempt {attempt + 1} failed: {e}")
-            if attempt < retries - 1:
-                await asyncio.sleep(delay)
-    logger.error("All health check attempts failed")
+            logger.warning(f"Health check failed (attempt {attempt + 1}/{retries}): {e}")
+        await asyncio.sleep(delay)
     return False
 
-def shutdown(sig, frame, gui: BlockchainGUI, network: BlockchainNetwork):
-    logger.info("Shutting down...")
-    gui.miner.stop_mining()
-    gui.root.quit()
-    if network.loop and not network.loop.is_closed():
-        if network.sync_task:
-            network.sync_task.cancel()
-        network.loop.call_soon_threadsafe(network.loop.stop)
+def shutdown(signum, frame, gui, network):
+    logger.info(f"Received signal {signum}, shutting down...")
+    gui.stop()
+    network.stop()
     sys.exit(0)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run a blockchain node.")
     parser.add_argument("--port", type=int, default=None, help="Port to run the node on")
     parser.add_argument("--bootstrap", type=str, default=None, help="Comma-separated list of bootstrap nodes (host:port)")
+    parser.add_argument("--validator", action="store_true", help="Run as validator node for key rotation")  # Added this
     args = parser.parse_args()
 
     port = args.port if args.port else find_available_port()
+    api_port = port + 1000  # Offset by 1000 to avoid conflicts (e.g., 5000 -> 6000)
     node_id = f"node{port}"
-    logger.info(f"Initializing blockchain and network on port {port}")
+    logger.info(f"Initializing blockchain on {port} and key rotation API on {api_port}")
+
+    # Initialize KeyRotationManager
+    init_rotation_manager(node_id)  # For utils.py
+    from key_rotation.core import KeyRotationManager
+    rotation_manager = KeyRotationManager(node_id=node_id, is_validator=args.validator)
+
+    # Start the key rotation API in a separate thread
+    from key_rotation.main import main as rotation_main
+    rotation_thread = threading.Thread(
+        target=rotation_main,
+        args=(node_id, args.validator, api_port, "127.0.0.1"),
+        daemon=True
+    )
+    rotation_thread.start()
+
     blockchain = Blockchain()
     bootstrap_nodes = []
     if args.bootstrap:
@@ -74,6 +72,7 @@ if __name__ == "__main__":
     elif os.path.exists("bootstrap_nodes.txt"):
         with open("bootstrap_nodes.txt", "r") as f:
             bootstrap_nodes = [(line.strip().split(":")[0], int(line.strip().split(":")[1])) for line in f if line.strip()]
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 

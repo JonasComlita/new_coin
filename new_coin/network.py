@@ -1,5 +1,6 @@
 import aiohttp
 import aiohttp.web
+from aiohttp import web
 import asyncio
 import ssl
 import ecdsa
@@ -42,6 +43,7 @@ class BlockchainNetwork:
         self.peers: Dict[str, tuple[str, int, str]] = self._load_peers()  # (host, port, public_key)
         self.app = aiohttp.web.Application(loop=loop, middlewares=[rate_limit_middleware])
         self.app.add_routes([
+            web.get("/health", self.health_handler),
             aiohttp.web.post('/receive_block', self.receive_block),
             aiohttp.web.post('/receive_transaction', self.receive_transaction),
             aiohttp.web.get('/get_chain', self.get_chain),
@@ -65,6 +67,11 @@ class BlockchainNetwork:
         self.last_announcement = 0
         self.peer_failures: Dict[str, int] = {}
         self.start_time = time.time()
+
+    async def health_handler(self, request):
+        """Handle health check requests."""
+        logger.info(f"Received health check request from {request.remote}")
+        return web.Response(status=200, text="OK")
 
     def run(self) -> None:
         logger.info(f"Setting up network server on {self.host}:{self.port}")
@@ -95,7 +102,8 @@ class BlockchainNetwork:
                 await asyncio.sleep(0.5 * (2 ** attempt))
 
     async def broadcast_block(self, block: Block):
-        for peer_id, (host, port) in list(self.peers.items()):
+        for peer_id, peer_data in list(self.peers.items()):
+            host, port, public_key = peer_data  # Unpack properly
             try:
                 await self.send_block(peer_id, host, port, block)
             except Exception as e:
@@ -121,12 +129,14 @@ class BlockchainNetwork:
         return aiohttp.web.Response(status=400)
 
     async def broadcast_transaction(self, transaction: 'Transaction'):
-        for peer_id, (host, port) in list(self.peers.items()):
+        for peer_id, peer_data in list(self.peers.items()):
+            host, port, public_key = peer_data  # Unpack properly
             try:
                 async with aiohttp.ClientSession() as session:
                     url = f"https://{host}:{port}/receive_transaction"
                     headers = {"Authorization": f"Bearer {PEER_AUTH_SECRET}"}
-                    async with session.post(url, json=transaction.to_dict(), headers=headers, ssl=self.ssl_context) as resp:
+                    # Fix the SSL context reference
+                    async with session.post(url, json=transaction.to_dict(), headers=headers, ssl=self.client_ssl_context) as resp:
                         if resp.status == 200:
                             logger.info(f"Transaction {transaction.tx_id[:8]} broadcast to {peer_id}")
                         else:
@@ -182,24 +192,26 @@ class BlockchainNetwork:
         message = f"{peer_id}{host}{port}".encode()
         
         # Verify the signature
-        try:
-            vk = ecdsa.VerifyingKey.from_string(bytes.fromhex(public_key), curve=ecdsa.SECP256k1)
-            if not vk.verify(signature, message):
-                logger.warning(f"Peer {peer_id} failed signature verification")
+        if public_key and signature:
+            try:
+                vk = ecdsa.VerifyingKey.from_string(bytes.fromhex(public_key), curve=ecdsa.SECP256k1)
+                if not vk.verify(signature, message):
+                    logger.warning(f"Peer {peer_id} failed signature verification")
+                    return aiohttp.web.Response(status=403)
+            except Exception as e:
+                logger.warning(f"Peer {peer_id} failed signature verification: {e}")
                 return aiohttp.web.Response(status=403)
-        except Exception as e:
-            logger.warning(f"Peer {peer_id} failed signature verification: {e}")
-            return aiohttp.web.Response(status=403)
 
-        # Call add_peer with public_key instead of shared_secret
-        await self.add_peer(peer_id, host, int(port), public_key)
+        auth_key = public_key if public_key else PEER_AUTH_SECRET
+        await self.add_peer(peer_id, host, int(port), auth_key)
         self._save_peers()
-        logger.info(f"Authenticated peer {peer_id} via signature")
+        logger.info(f"Authenticated peer {peer_id}")
         return aiohttp.web.Response(status=200)
 
     async def broadcast_peer_announcement(self):
         sk = ecdsa.SigningKey.from_string(bytes.fromhex(self.private_key), curve=ecdsa.SECP256k1)
-        for peer_id, (host, port, _) in list(self.peers.items()):
+        for peer_id, peer_data in list(self.peers.items()):
+            host, port, peer_pubkey = peer_data  # Unpack properly
             message = f"{self.node_id}{self.host}{self.port}".encode()
             signature = sk.sign(message).hex()
             url = f"https://{host}:{port}/announce_peer"
@@ -220,11 +232,22 @@ class BlockchainNetwork:
                         logger.warning(f"Failed to announce to {peer_id}: {resp.status}")
 
     async def get_peers(self, request):
-        peer_list = [{"peer_id": pid, "host": host, "port": port} for pid, (host, port) in self.peers.items() if (host, port) != (self.host, self.port)]
+        # Update the list comprehension to handle 3-tuple peer data
+        peer_list = []
+        for pid, peer_data in self.peers.items():
+            host, port, _ = peer_data  # Unpack all three values, ignore the public_key
+            if (host, port) != (self.host, self.port):
+                peer_list.append({"peer_id": pid, "host": host, "port": port})
+        
+        # Shuffle the list to promote network diversity
         random.shuffle(peer_list)
-        return aiohttp.web.json_response(peer_list[:min(CONFIG["max_peers"], len(peer_list))])
-
+        # Limit the number of peers returned
+        limited_list = peer_list[:min(CONFIG["max_peers"], len(peer_list))]
+        return aiohttp.web.json_response(limited_list)
+    
     async def discover_peers(self):
+        """Discover peers from known nodes."""
+        # First part: try to discover from bootstrap nodes
         for host, port in self.bootstrap_nodes:
             if (host, port) != (self.host, self.port):
                 peer_id = f"node{port}"
@@ -235,8 +258,20 @@ class BlockchainNetwork:
                 else:
                     logger.info(f"Skipping unresponsive bootstrap node {peer_id} at {host}:{port}")
 
-        if self.peers:
-            peer_id, (host, port) = random.choice(list(self.peers.items()))
+        # Second part: discover from existing peers
+        if not self.peers:
+            logger.info("No peers to discover from.")
+            return
+        
+        # Choose a random peer - this is where the error occurs
+        try:
+            # The issue is here - you need to unpack 3 values, not 2
+            peer_id, peer_data = random.choice(list(self.peers.items()))
+            host, port, public_key = peer_data  # Properly unpack the 3 values
+            
+            logger.info(f"Discovering peers from {peer_id} at {host}:{port}")
+            
+            # Request peers from the selected peer
             try:
                 async with aiohttp.ClientSession() as session:
                     url = f"https://{host}:{port}/get_peers"
@@ -250,7 +285,11 @@ class BlockchainNetwork:
             except Exception as e:
                 logger.warning(f"Peer exchange failed with {peer_id}: {e}")
                 self._increment_failure(peer_id)
-        logger.info("Initial peer discovery completed")
+        except ValueError as e:
+            logger.error(f"Failed to select peer for discovery: {e}")
+            return
+            
+        logger.info("Peer discovery completed")
 
     async def add_peer(self, peer_id: str, host: str, port: int, public_key: str):
         peer_key = (host, port)
@@ -276,7 +315,8 @@ class BlockchainNetwork:
     async def request_chain(self):
         best_chain = self.blockchain.chain
         best_difficulty = self.blockchain.get_total_difficulty()
-        for peer_id, (host, port) in list(self.peers.items()):
+        for peer_id, peer_data in list(self.peers.items()):
+            host, port, public_key = peer_data  # Unpack properly
             try:
                 async with aiohttp.ClientSession() as session:
                     url = f"https://{host}:{port}/get_chain"
@@ -296,26 +336,94 @@ class BlockchainNetwork:
                 logger.warning(f"Failed to get chain from {peer_id}: {e}")
                 self._increment_failure(peer_id)
 
-    def start_periodic_sync(self):
-        async def sync_and_discover():
-            logger.info("Starting periodic sync and discovery loop")
+    async def sync_and_discover(self):
+        """Synchronize the blockchain and discover new peers."""
+        try:
+            logger.info("Sync and discovery cycle starting")
+            # Update difficulty before syncing
+            self.blockchain.difficulty = self.blockchain.adjust_difficulty()
+            
+            # Run peer discovery
             await self.discover_peers()
-            logger.info("Initial peer discovery completed")
-            self.discovery_task = self.loop.create_task(self.periodic_discovery())
-            while True:
-                logger.info("Sync loop iteration starting")
-                self.blockchain.difficulty = self.blockchain.adjust_difficulty()
-                await self.request_chain()
-                await self.broadcast_peer_announcement()
-                logger.info("Sync loop iteration completed")
-                await asyncio.sleep(CONFIG["sync_interval"])
-
-        self.sync_task = self.loop.create_task(sync_and_discover())
-        return sync_and_discover()
+            
+            # Request latest chain from peers
+            await self.request_chain()
+            
+            # Announce this node to peers
+            await self.broadcast_peer_announcement()
+            
+            logger.info("Sync and discovery cycle completed successfully")
+        except Exception as e:
+            logger.error(f"Error during sync and discovery: {e}")
+            # Consider adding more detailed error handling based on exception type
 
     async def periodic_discovery(self):
-        while True:
-            await self.discover_peers()
-            if not self.peers and time.time() - self.start_time > 300:
-                logger.warning("Network isolated: no peers detected for 5 minutes")
-            await asyncio.sleep(CONFIG["peer_discovery_interval"])
+        """Run peer discovery at regular intervals."""
+        try:
+            while True:
+                await self.discover_peers()
+                await asyncio.sleep(CONFIG["peer_discovery_interval"])
+        except asyncio.CancelledError:
+            logger.info("Periodic discovery task cancelled")
+        except Exception as e:
+            logger.error(f"Error in periodic discovery: {e}")
+            # Re-raise to ensure the task failure is properly handled
+            raise
+
+    def start_periodic_sync(self):
+        """
+        Start periodic synchronization and discovery as background tasks.
+        Returns the main sync task for monitoring.
+        """
+        # Check if sync task exists and is still running
+        if hasattr(self, 'sync_task') and isinstance(self.sync_task, asyncio.Task) and not self.sync_task.done():
+            logger.warning("Sync task already running, not starting a new one")
+            return self.sync_task
+            
+        async def sync_loop():
+            try:
+                logger.info("Starting periodic sync loop")
+                
+                # Initial discovery and sync
+                await self.discover_peers()
+                logger.info("Initial peer discovery completed")
+                
+                # Start the dedicated discovery task
+                if not hasattr(self, 'discovery_task') or not isinstance(self.discovery_task, asyncio.Task) or self.discovery_task.done():
+                    self.discovery_task = self.loop.create_task(self.periodic_discovery())
+                    self.discovery_task.add_done_callback(self._handle_task_result)
+                
+                # Main sync loop with proper error handling
+                while True:
+                    try:
+                        await self.sync_and_discover()
+                    except Exception as e:
+                        logger.error(f"Error in sync cycle: {e}")
+                        # Continue despite errors but with a slightly longer delay
+                        await asyncio.sleep(min(CONFIG["sync_interval"] * 1.5, 60))
+                    else:
+                        await asyncio.sleep(CONFIG["sync_interval"])
+            except asyncio.CancelledError:
+                logger.info("Sync loop task cancelled")
+                # Clean cancellation of the discovery task if needed
+                if hasattr(self, 'discovery_task') and isinstance(self.discovery_task, asyncio.Task) and not self.discovery_task.done():
+                    self.discovery_task.cancel()
+            except Exception as e:
+                logger.critical(f"Fatal error in sync loop: {e}")
+                raise
+
+        # Create and store the main sync task
+        self.sync_task = self.loop.create_task(sync_loop())
+        self.sync_task.add_done_callback(self._handle_task_result)
+        return self.sync_task
+        
+    def _handle_task_result(self, task):
+        """Handle completed tasks and log any exceptions."""
+        try:
+            # This will re-raise any exception that occurred in the task
+            task.result()
+        except asyncio.CancelledError:
+            # Normal cancellation, no action needed
+            pass
+        except Exception as e:
+            logger.error(f"Task failed with exception: {e}")

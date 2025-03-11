@@ -13,20 +13,39 @@ import socket
 from dotenv import load_dotenv
 from key_rotation.core import KeyRotationManager
 import requests
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
 
-rotation_manager = KeyRotationManager()
+# Initialize with a consistent node_id (to be set by main.py)
+rotation_manager = None
 
-# Get the secret directly from the manager
-PEER_AUTH_SECRET = os.getenv("PEER_AUTH_SECRET")
-if not PEER_AUTH_SECRET:
-    PEER_AUTH_SECRET = rotation_manager.get_current_auth_secret()
-    if not PEER_AUTH_SECRET:
-        raise ValueError("Failed to get current secret from key rotation manager")
+def init_rotation_manager(node_id):
+    global rotation_manager
+    import time
+    start_time = time.time()
+    rotation_manager = KeyRotationManager(node_id=node_id)
+    duration = time.time() - start_time
+    logger.info(f"Initialized KeyRotationManager for {node_id} in {duration:.3f} seconds")
 
-# Function to validate peer authentication
+def get_peer_auth_secret():
+    import time
+    if not rotation_manager:
+        raise ValueError("Rotation manager not initialized")
+    start_time = time.time()
+    secret = rotation_manager.get_current_auth_secret()
+    duration = time.time() - start_time
+    logger.info(f"Retrieved peer auth secret in {duration * 1e6:.2f} µs")
+    return secret
+
+# Default to function for dynamic access
+PEER_AUTH_SECRET = get_peer_auth_secret
+
 def validate_peer_auth(received_auth):
     """
     Validates peer authentication against current and previous secrets.
@@ -37,7 +56,14 @@ def validate_peer_auth(received_auth):
     Returns:
         bool: True if authentication is valid, False otherwise
     """
-    return rotation_manager.authenticate_peer(received_auth)
+    import time
+    if not rotation_manager:
+        raise ValueError("Rotation manager not initialized")
+    start_time = time.time()
+    result = rotation_manager.authenticate_peer(received_auth)
+    duration = time.time() - start_time
+    logger.info(f"Validated peer auth in {duration * 1e6:.2f} µs")
+    return result
 
 SSL_CERT_PATH = os.getenv("SSL_CERT_PATH", "server.crt")
 SSL_KEY_PATH = os.getenv("SSL_KEY_PATH", "server.key")

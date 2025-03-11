@@ -892,7 +892,12 @@ class KeyRotationManager:
     
     def _generate_secure_secret(self, length: int = 64) -> str:
         """Generate a cryptographically secure random secret."""
-        return base64.b64encode(os.urandom(length)).decode('utf-8')
+        import time
+        start_time = time.time()
+        secret = base64.b64encode(os.urandom(length)).decode('utf-8')
+        duration = time.time() - start_time
+        logger.info(f"Generated secure secret in {duration * 1e6:.2f} µs")
+        return secret
     
     def _hash_secret(self, secret: str) -> str:
         """Create a hash of the secret for verification."""
@@ -1025,6 +1030,8 @@ class KeyRotationManager:
             logger.error("Cannot distribute key: missing current auth secret")
             return
         
+        import time
+        start_time = time.time()
         try:
             # Prepare encrypted keys for each node
             encrypted_keys = {}
@@ -1039,14 +1046,17 @@ class KeyRotationManager:
                 if not public_key:
                     continue
                 
+                node_start = time.time()
                 encrypted_secret = self.pki.encrypt_message(self.current_auth_secret, public_key)
+                logger.info(f"Encrypted key for {node_id} in {(time.time() - node_start) * 1e3:.2f} ms")
                 encrypted_keys[node_id] = encrypted_secret
             
             # Broadcast the encrypted keys
             key_hash = self._hash_secret(self.current_auth_secret)
             self.p2p.broadcast_finalized_key(self.pending_proposal_id, key_hash, encrypted_keys)
             
-            logger.info("Successfully distributed finalized key to the network")
+            total_duration = time.time() - start_time
+            logger.info(f"Distributed finalized key to {len(encrypted_keys)} nodes in {total_duration:.3f} seconds")
         except Exception as e:
             logger.error(f"Failed to distribute finalized key: {e}")
     
@@ -1120,19 +1130,28 @@ class KeyRotationManager:
     
     def authenticate_peer(self, provided_secret: str) -> bool:
         """Authenticate a peer using either current or previous secret."""
-        # Check against current secret
+        import time
+        start_time = time.time()
         if provided_secret == self.current_auth_secret:
+            duration = time.time() - start_time
+            logger.info(f"Authenticated with current secret in {duration * 1e6:.2f} µs")
             return True
-        
-        # Check against previous secret (grace period)
         if self.previous_auth_secret:
             last_rotation = self.secure_storage.retrieve("last_rotation_time") or "0"
             if time.time() - float(last_rotation) < 172800:  # 48 hours
                 if provided_secret == self.previous_auth_secret:
-                    logger.info("Peer authenticated with previous secret")
+                    duration = time.time() - start_time
+                    logger.info(f"Authenticated with previous secret in {duration * 1e6:.2f} µs")
                     return True
+        duration = time.time() - start_time
+        logger.info(f"Authentication failed in {duration * 1e6:.2f} µs")
         return False
     
     def get_current_auth_secret(self) -> str:
         """Get the current authentication secret."""
-        return self.current_auth_secret
+        import time
+        start_time = time.time()
+        secret = self.current_auth_secret
+        duration = time.time() - start_time
+        logger.info(f"Accessed current_auth_secret in {duration * 1e6:.2f} µs")
+        return secret
