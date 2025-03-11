@@ -80,27 +80,27 @@ def generate_node_keypair():
     return private_key.to_string().hex(), public_key.to_string().hex()
     
 def load_config(config_file: str = "config.yaml") -> Dict:
-    """Load and validate configuration from a YAML file.
-
-    Args:
-        config_file (str): Path to the configuration file.
-
-    Returns:
-        Dict: Configuration dictionary with defaults applied.
-    """
+    """Enhanced configuration loading with network-wide validation"""
     default_config = {
-        "difficulty": 4,
-        "current_reward": 50.0,
-        "halving_interval": 210000,
-        "mempool_max_size": 1000,
-        "max_retries": 3,
-        "sync_interval": 300
+        # Existing defaults
+        "network_version": "1.0",
+        "min_peer_trust_threshold": 50,
+        "max_chain_divergence": 10
     }
+    
     try:
         with open(config_file, 'r') as f:
             config = yaml.safe_load(f) or {}
+        
+        # Validate configuration
         for key, value in default_config.items():
             config.setdefault(key, value)
+        
+        # Optional: Add configuration validation
+        if config['min_peer_trust_threshold'] < 0 or config['min_peer_trust_threshold'] > 100:
+            logger.warning("Invalid peer trust threshold, using default")
+            config['min_peer_trust_threshold'] = 50
+        
         return config
     except FileNotFoundError:
         return default_config

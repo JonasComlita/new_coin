@@ -630,3 +630,5 @@ class Blockchain:
         tx = Transaction(tx_type=TransactionType.TRANSFER, inputs=inputs, outputs=outputs, fee=fee)
         tx.sign(sender_private_key)
         return tx
+    
+    

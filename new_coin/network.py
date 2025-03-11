@@ -68,6 +68,69 @@ class BlockchainNetwork:
         self.peer_failures: Dict[str, int] = {}
         self.start_time = time.time()
 
+        self.peer_trust_scores = defaultdict(lambda: {
+                'successful_responses': 0,
+                'failed_responses': 0,
+                'total_score': 100
+            })
+        
+        self.partition_detection_threshold = 0.5
+
+    def _update_peer_trust(self, peer_id, success):
+        """Update peer trust score"""
+        peer_data = self.peer_trust_scores[peer_id]
+        
+        if success:
+            peer_data['successful_responses'] += 1
+            peer_data['total_score'] = min(100, peer_data['total_score'] + 1)
+        else:
+            peer_data['failed_responses'] += 1
+            peer_data['total_score'] = max(0, peer_data['total_score'] - 2)
+        
+        # Optional: Periodically clean up old peer scores
+        if len(self.peer_trust_scores) > 100:
+            lowest_scored_peers = sorted(
+                self.peer_trust_scores.items(), 
+                key=lambda x: x[1]['total_score']
+            )[:10]
+            for peer_id, _ in lowest_scored_peers:
+                del self.peer_trust_scores[peer_id]
+
+    async def detect_network_partition(self):
+        """Detect potential network partitions"""
+        if not self.peers:
+            return False
+
+        chain_versions = defaultdict(list)
+        for peer_id, (host, port, _) in self.peers.items():
+            # You might need to modify this to actually fetch peer chains
+            try:
+                chain = await self.fetch_peer_chain(host, port)
+                chain_hash = hash(tuple(block.header.hash for block in chain))
+                chain_versions[chain_hash].append(peer_id)
+            except Exception:
+                continue
+
+        if not chain_versions:
+            return False
+
+        majority_chain = max(chain_versions, key=lambda k: len(chain_versions[k]))
+        partition_ratio = len(chain_versions[majority_chain]) / len(self.peers)
+
+        if partition_ratio < self.partition_detection_threshold:
+            logger.warning(f"Network partition detected! Partition ratio: {partition_ratio}")
+            await self.resolve_network_partition(chain_versions)
+            return True
+        return False
+
+    async def resolve_network_partition(self, chain_versions):
+        """Resolve network partition by selecting most representative chain"""
+        majority_chain_hash = max(chain_versions, key=lambda k: len(chain_versions[k]))
+        majority_peers = chain_versions[majority_chain_hash]
+        
+        # Logic to synchronize or elect a primary chain
+        logger.info(f"Resolving partition with {len(majority_peers)} peers")
+
     async def health_handler(self, request):
         """Handle health check requests."""
         logger.info(f"Received health check request from {request.remote}")
@@ -192,6 +255,7 @@ class BlockchainNetwork:
         message = f"{peer_id}{host}{port}".encode()
         
         # Verify the signature
+        start_time = time.time()
         if public_key and signature:
             try:
                 vk = ecdsa.VerifyingKey.from_string(bytes.fromhex(public_key), curve=ecdsa.SECP256k1)
@@ -201,8 +265,10 @@ class BlockchainNetwork:
             except Exception as e:
                 logger.warning(f"Peer {peer_id} failed signature verification: {e}")
                 return aiohttp.web.Response(status=403)
+        logger.info(f"Validated peer auth in {(time.time() - start_time) * 1e6:.2f} µs")
 
         auth_key = public_key if public_key else PEER_AUTH_SECRET
+        logger.info(f"Retrieved peer auth secret in {(time.time() - start_time) * 1e6:.2f} µs")
         await self.add_peer(peer_id, host, int(port), auth_key)
         self._save_peers()
         logger.info(f"Authenticated peer {peer_id}")
@@ -266,25 +332,35 @@ class BlockchainNetwork:
         # Choose a random peer - this is where the error occurs
         try:
             # The issue is here - you need to unpack 3 values, not 2
-            peer_id, peer_data = random.choice(list(self.peers.items()))
-            host, port, public_key = peer_data  # Properly unpack the 3 values
-            
-            logger.info(f"Discovering peers from {peer_id} at {host}:{port}")
-            
-            # Request peers from the selected peer
-            try:
-                async with aiohttp.ClientSession() as session:
-                    url = f"https://{host}:{port}/get_peers"
-                    headers = {"Authorization": f"Bearer {PEER_AUTH_SECRET}"}
-                    async with session.get(url, headers=headers, ssl=self.client_ssl_context) as resp:
-                        if resp.status == 200:
-                            peers_data = await resp.json()
-                            for peer in peers_data:
-                                if (peer["host"], peer["port"]) != (self.host, self.port):
-                                    await self.add_peer(peer["peer_id"], peer["host"], peer["port"], PEER_AUTH_SECRET)
-            except Exception as e:
-                logger.warning(f"Peer exchange failed with {peer_id}: {e}")
-                self._increment_failure(peer_id)
+            for peer_id, peer_data in list(self.peers.items()):
+                trust_score = self.peer_trust_scores[peer_id]['total_score']
+                
+                # Skip peers with very low trust
+                if trust_score < 20:
+                    logger.info(f"Skipping low-trust peer {peer_id}")
+                    continue
+                
+                # Prioritize higher trust peers
+                discovery_probability = trust_score / 100
+                if random.random() < discovery_probability:
+                    host, port, public_key = peer_data  # Properly unpack the 3 values
+                    
+                    logger.info(f"Discovering peers from {peer_id} at {host}:{port}")
+                    
+                    # Request peers from the selected peer
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            url = f"https://{host}:{port}/get_peers"
+                            headers = {"Authorization": f"Bearer {PEER_AUTH_SECRET}"}
+                            async with session.get(url, headers=headers, ssl=self.client_ssl_context) as resp:
+                                if resp.status == 200:
+                                    peers_data = await resp.json()
+                                    for peer in peers_data:
+                                        if (peer["host"], peer["port"]) != (self.host, self.port):
+                                            await self.add_peer(peer["peer_id"], peer["host"], peer["port"], PEER_AUTH_SECRET)
+                    except Exception as e:
+                        logger.warning(f"Peer exchange failed with {peer_id}: {e}")
+                        self._increment_failure(peer_id)
         except ValueError as e:
             logger.error(f"Failed to select peer for discovery: {e}")
             return

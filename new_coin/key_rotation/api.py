@@ -1,12 +1,24 @@
 # api.py
 from flask import Flask, request, jsonify
 from functools import wraps
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 def create_rotation_api(app, rotation_manager):
     """
     Create API endpoints for the key rotation system.
     This integrates with a Flask application.
     """
+    # Add error handler for all uncaught exceptions
+    @app.errorhandler(Exception)
+    def handle_exception(e):
+        import traceback
+        logger.error(f"Unhandled exception: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": "Internal server error", "message": str(e)}), 500
     
     def require_auth(f):
         @wraps(f)
@@ -75,34 +87,49 @@ def create_rotation_api(app, rotation_manager):
     @require_auth
     def propose_rotation():
         """Endpoint to propose a new key rotation."""
-        if not rotation_manager.is_validator:
-            return jsonify({"error": "Only validators can propose rotations"}), 403
-        
-        # Generate a new key and create a proposal
-        new_key = rotation_manager._generate_secure_secret()
-        key_hash = rotation_manager._hash_secret(new_key)
-        
-        # Store the pending key
-        rotation_manager.pending_auth_secret = new_key
-        rotation_manager.secure_storage.store("pending_auth_secret", new_key)
-        
-        # Create the proposal
-        proposal_id = rotation_manager.consensus.create_proposal(key_hash)
-        
-        if proposal_id:
-            # Store the proposal ID
-            rotation_manager.pending_proposal_id = proposal_id
-            rotation_manager.secure_storage.store("pending_proposal_id", proposal_id)
+        try:
+            logger.info("Received propose_rotation request")
+            if not rotation_manager.is_validator:
+                logger.error("Node is not a validator")
+                return jsonify({"error": "Only validators can propose rotations"}), 403
             
-            # Broadcast the proposal
-            rotation_manager.p2p.broadcast_proposal(proposal_id)
+            # Generate a new key and create a proposal
+            logger.info("Generating new secret key")
+            new_key = rotation_manager._generate_secure_secret()
+            key_hash = rotation_manager._hash_secret(new_key)
             
-            return jsonify({
-                "status": "success",
-                "proposal_id": proposal_id
-            })
-        else:
-            return jsonify({"error": "Failed to create proposal"}), 500
+            # Store the pending key
+            logger.info("Storing pending secret")
+            rotation_manager.pending_auth_secret = new_key
+            rotation_manager.secure_storage.store("pending_auth_secret", new_key)
+            
+            # Create the proposal
+            logger.info("Creating consensus proposal")
+            proposal_id = rotation_manager.consensus.create_proposal(key_hash)
+            
+            if proposal_id:
+                # Store the proposal ID
+                logger.info(f"Proposal created successfully: {proposal_id}")
+                rotation_manager.pending_proposal_id = proposal_id
+                rotation_manager.secure_storage.store("pending_proposal_id", proposal_id)
+                
+                # Broadcast the proposal
+                logger.info(f"Broadcasting proposal {proposal_id}")
+                broadcast_result = rotation_manager.p2p.broadcast_proposal(proposal_id)
+                logger.info(f"Broadcast result: {broadcast_result}")
+                
+                return jsonify({
+                    "status": "success",
+                    "proposal_id": proposal_id
+                })
+            else:
+                logger.error("Failed to create proposal")
+                return jsonify({"error": "Failed to create proposal"}), 500
+        except Exception as e:
+            import traceback
+            logger.error(f"Exception in propose_rotation: {str(e)}")
+            logger.error(traceback.format_exc())
+            return jsonify({"error": f"Server error: {str(e)}"}), 500
     
     @app.route('/api/v1/rotation/vote', methods=['POST'])
     @require_auth
@@ -202,6 +229,7 @@ def create_rotation_api(app, rotation_manager):
         success = rotation_manager.receive_key(data['encrypted_key'])
         
         if success:
+            logger.info("Rotation API endpoints registered successfully")
             return jsonify({"status": "success"})
         else:
             return jsonify({"error": "Failed to process received key"}), 500
@@ -226,3 +254,16 @@ def create_rotation_api(app, rotation_manager):
             return jsonify({"status": "valid"}), 200
         else:
             return jsonify({"status": "invalid"}), 401
+        
+    # Add this function to the API to check registered nodes
+    @app.route('/api/v1/nodes/debug', methods=['GET'])
+    def debug_nodes():
+        """Endpoint to get debugging info about registered nodes."""
+        nodes = rotation_manager.node_registry.get_all_nodes()
+        active_nodes = rotation_manager.node_registry.get_active_nodes()
+        return jsonify({
+            "total_nodes": len(nodes),
+            "active_nodes": len(active_nodes),
+            "nodes": {node_id: {"url": data.get("url"), "last_seen": data.get("last_seen")} for node_id, data in nodes.items()},
+            "active": {node_id: {"url": data.get("url"), "last_seen": data.get("last_seen")} for node_id, data in active_nodes.items()}
+        })

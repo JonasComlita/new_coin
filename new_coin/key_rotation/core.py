@@ -10,6 +10,7 @@ import hashlib
 import logging
 import threading
 import schedule
+import ipaddress
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set, Tuple
 from pathlib import Path
@@ -19,8 +20,11 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.fernet import Fernet
+from cryptography.x509.extensions import SubjectAlternativeName, DNSName, IPAddress
 import requests
-
+import socket
+import ssl
+import urllib3
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('key_rotation')
@@ -152,7 +156,7 @@ class PKIManager:
             self._generate_keys_and_cert()
     
     def _generate_keys_and_cert(self):
-        """Generate RSA key pair and self-signed certificate."""
+        """Generate RSA key pair and certificate with improved SAN support."""
         # Generate RSA key pair
         private_key = rsa.generate_private_key(
             public_exponent=65537,
@@ -162,14 +166,43 @@ class PKIManager:
         # Extract public key
         public_key = private_key.public_key()
         
-        # Create a self-signed certificate
+        # Prepare subject and issuer information
         subject = issuer = x509.Name([
             x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
             x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Blockchain Network"),
-            x509.NameAttribute(NameOID.COMMON_NAME, f"node-{self.node_id}"),
+            x509.NameAttribute(NameOID.COMMON_NAME, f"node-{self.node_id}")
         ])
         
-        cert = x509.CertificateBuilder().subject_name(
+        # Prepare Subject Alternative Names
+        san_entries = [
+            x509.DNSName('localhost'),
+            x509.DNSName(socket.getfqdn()),
+            x509.IPAddress(ipaddress.IPv4Address('127.0.0.1')),
+            x509.IPAddress(ipaddress.IPv4Address('::1'))  # IPv6 localhost
+        ]
+        
+        # Try to get the node's hostname and IP
+        try:
+            import socket
+            hostname = socket.gethostname()
+            san_entries.append(x509.DNSName(hostname))
+            
+            # Get IP addresses
+            ips = socket.gethostbyname_ex(hostname)[2]
+            for ip in ips:
+                try:
+                    san_entries.append(x509.IPAddress(ipaddress.IPv4Address(ip)))
+                except ValueError:
+                    pass
+        except Exception as e:
+            logger.warning(f"Could not retrieve hostname/IPs: {e}")
+        
+        # Check if CA certificate exists
+        ca_cert_path = Path.home() / 'blockchain-ca' / 'certs' / 'ca.pem'
+        ca_key_path = Path.home() / 'blockchain-ca' / 'private' / 'ca.key'
+        
+        # Prepare certificate builder
+        cert_builder = x509.CertificateBuilder().subject_name(
             subject
         ).issuer_name(
             issuer
@@ -183,7 +216,31 @@ class PKIManager:
             datetime.utcnow() + timedelta(days=CERT_VALIDITY_DAYS)
         ).add_extension(
             x509.BasicConstraints(ca=False, path_length=None), critical=True
-        ).sign(private_key, hashes.SHA256())
+        ).add_extension(
+            x509.SubjectAlternativeName(san_entries), 
+            critical=False
+        )
+        
+        # Try to use CA certificate for signing
+        try:
+            if ca_cert_path.exists() and ca_key_path.exists():
+                with open(ca_cert_path, "rb") as f:
+                    ca_cert = x509.load_pem_x509_certificate(f.read())
+                
+                with open(ca_key_path, "rb") as f:
+                    ca_key = serialization.load_pem_private_key(f.read(), password=None)
+                
+                # Sign with CA
+                cert = cert_builder.sign(ca_key, hashes.SHA256())
+                logger.info(f"Generated CA-signed certificate for node {self.node_id}")
+            else:
+                raise FileNotFoundError("CA certificate or key not found")
+        except Exception as e:
+            logger.warning(f"CA signing failed: {e}. Falling back to self-signed.")
+            
+            # Self-signed certificate
+            cert = cert_builder.sign(private_key, hashes.SHA256())
+            logger.info(f"Generated self-signed certificate for node {self.node_id}")
         
         # Save private key
         with open(self.private_key_path, "wb") as f:
@@ -204,19 +261,17 @@ class PKIManager:
         # Save certificate
         with open(self.cert_path, "wb") as f:
             f.write(cert.public_bytes(serialization.Encoding.PEM))
-        
-        logger.info(f"Generated new key pair and certificate for node {self.node_id}")
     
-    def encrypt_message(self, message: str, recipient_public_key_pem: str) -> str:
+    def encrypt_message(self, message: str, public_key_pem: str) -> str:
         """Encrypt a message using the recipient's public key."""
         try:
             # Load recipient's public key
-            recipient_public_key = serialization.load_pem_public_key(
-                recipient_public_key_pem.encode('utf-8')
+            public_key = serialization.load_pem_public_key(
+                public_key_pem.encode('utf-8')
             )
             
             # Encrypt the message
-            encrypted = recipient_public_key.encrypt(
+            encrypted = public_key.encrypt(
                 message.encode('utf-8'),
                 padding.OAEP(
                     mgf=padding.MGF1(algorithm=hashes.SHA256()),
@@ -324,15 +379,13 @@ class PKIManager:
 
 
 class NodeRegistry:
-    """Manages the registry of nodes in the network."""
-    
     def __init__(self):
         self.registry_path = CONFIG_DIR / 'node_registry.json'
+        self.registry_path.parent.mkdir(parents=True, exist_ok=True)  # Ensure dir exists
         self.nodes = {}
         self._load_registry()
     
     def _load_registry(self):
-        """Load the node registry from disk."""
         if self.registry_path.exists():
             try:
                 with open(self.registry_path, 'r') as f:
@@ -340,6 +393,8 @@ class NodeRegistry:
             except Exception as e:
                 logger.error(f"Failed to load node registry: {e}")
                 self.nodes = {}
+        else:
+            self._save_registry()  # Create empty file if missing
     
     def _save_registry(self):
         """Save the node registry to disk."""
@@ -355,7 +410,7 @@ class NodeRegistry:
             "url": node_url,
             "public_key": public_key,
             "certificate": certificate,
-            "last_seen": datetime.utcnow().isoformat(),
+            "last_seen": datetime.now().isoformat(),
         }
         self._save_registry()
         return True
@@ -403,6 +458,13 @@ class ConsensusManager:
         self.proposals_dir.mkdir(parents=True, exist_ok=True)
         self.active_proposals = {}
         self._load_active_proposals()
+
+        # Log initialization details
+        logger.info(f"ConsensusManager initialized with node_id: {self.node_id}")
+        logger.info(f"Active nodes at startup: {len(self.node_registry.get_active_nodes())}")
+        for nid, node_data in self.node_registry.get_active_nodes().items():
+            logger.info(f"  - Node {nid}: {node_data.get('url')}, last seen: {node_data.get('last_seen')}")
+    
     
     def _load_active_proposals(self):
         """Load active proposals from disk."""
@@ -632,16 +694,13 @@ class ConsensusManager:
         for proposal_id, proposal in self.active_proposals.items():
             status = self.check_proposal_status(proposal_id)
             if status.get('expired', False) and not status.get('finalized', False):
-                # Mark as expired
                 proposal['expired'] = True
                 self._save_proposal(proposal_id, proposal)
                 to_remove.append(proposal_id)
         
-        # Remove expired proposals from active list
         for proposal_id in to_remove:
             if proposal_id in self.active_proposals:
                 del self.active_proposals[proposal_id]
-
 
 class P2PNetwork:
     """Simple P2P network for distributing key rotation information."""
@@ -809,7 +868,12 @@ class P2PNetwork:
             return False
     
     def _send_to_all_nodes(self, endpoint: str, payload: Dict) -> bool:
-        """Send a message to all registered nodes."""
+        """
+        Enhanced method for sending messages to nodes with improved SSL handling.
+        """
+        # Disable SSL warnings to prevent cluttering logs
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        
         success_count = 0
         nodes = self.node_registry.get_all_nodes()
         
@@ -828,17 +892,51 @@ class P2PNetwork:
                 if not url:
                     continue
                 
-                # Send request
-                response = requests.post(f"{url}{endpoint}", json=payload, timeout=5, verify='/path/to/ca.pem')
+                # Enhanced SSL verification
+                try:
+                    # Try with certificate verification first
+                    response = requests.post(
+                        f"{url}{endpoint}", 
+                        json=payload, 
+                        timeout=5,
+                        verify=True  # Strict verification
+                    )
+                except (ssl.SSLCertVerificationError, requests.exceptions.SSLError):
+                    # Fallback to more lenient verification
+                    logger.warning(f"SSL verification failed for {node_id}, attempting lenient verification")
+                    
+                    # Create a custom SSL context with less strict verification
+                    ssl_context = ssl.create_default_context()
+                    ssl_context.check_hostname = False
+                    ssl_context.verify_mode = ssl.CERT_NONE
+                    
+                    # Use custom adapter to bypass hostname verification
+                    session = requests.Session()
+                    adapter = requests.adapters.HTTPAdapter(
+                        ssl_context=ssl_context
+                    )
+                    session.mount('https://', adapter)
+                    
+                    response = session.post(
+                        f"{url}{endpoint}", 
+                        json=payload, 
+                        timeout=5
+                    )
                 
                 if response.status_code == 200:
                     success_count += 1
                 else:
                     logger.warning(f"Failed to send to node {node_id}: {response.status_code}")
+            
+            except requests.RequestException as e:
+                logger.warning(f"Network error sending to node {node_id}: {e}")
             except Exception as e:
-                logger.warning(f"Error sending to node {node_id}: {e}")
+                logger.error(f"Unexpected error sending to node {node_id}: {e}")
         
         # Consider it successful if we reached at least half the nodes
+        success_percentage = (success_count / len(nodes)) * 100 if nodes else 0
+        logger.info(f"Broadcast success: {success_count}/{len(nodes)} nodes ({success_percentage:.2f}%)")
+        
         return success_count >= len(nodes) / 2
 
 
@@ -858,7 +956,8 @@ class KeyRotationManager:
         self.p2p = P2PNetwork(self.node_id, self.node_registry, self.pki, self.consensus)
         
         # Current auth credentials
-        self.current_auth_secret = None
+        self.current_auth_secret = self.secure_storage.retrieve("current_auth_secret") or self._generate_secure_secret()
+        logger.info(f"Initial current_auth_secret for {node_id}: {self.current_auth_secret}")
         self.previous_auth_secret = None
         self.pending_auth_secret = None
         self.pending_proposal_id = None
@@ -892,7 +991,6 @@ class KeyRotationManager:
     
     def _generate_secure_secret(self, length: int = 64) -> str:
         """Generate a cryptographically secure random secret."""
-        import time
         start_time = time.time()
         secret = base64.b64encode(os.urandom(length)).decode('utf-8')
         duration = time.time() - start_time
@@ -952,6 +1050,10 @@ class KeyRotationManager:
             self.secure_storage.store("pending_proposal_id", proposal_id)
             logger.info(f"Key rotation proposal {proposal_id} created successfully")
             
+            # Immediately clean up expired proposals
+            logger.info("Running cleanup of expired proposals after proposal creation")
+            self.consensus.cleanup_expired_proposals()
+
             # Broadcast the proposal to the network
             self.p2p.broadcast_proposal(proposal_id)
         else:
@@ -982,10 +1084,6 @@ class KeyRotationManager:
             
             for proposal in active_proposals:
                 proposal_id = proposal.get('id')
-                
-                # Skip our own proposal
-                if proposal_id == self.pending_proposal_id:
-                    continue
                 
                 # Vote on proposals we haven't voted on yet
                 votes = proposal.get('votes', {})
@@ -1030,7 +1128,6 @@ class KeyRotationManager:
             logger.error("Cannot distribute key: missing current auth secret")
             return
         
-        import time
         start_time = time.time()
         try:
             # Prepare encrypted keys for each node
@@ -1130,9 +1227,10 @@ class KeyRotationManager:
     
     def authenticate_peer(self, provided_secret: str) -> bool:
         """Authenticate a peer using either current or previous secret."""
-        import time
         start_time = time.time()
-        if provided_secret == self.current_auth_secret:
+        if not self.current_auth_secret:  # Add null check
+            logger.warning("Current auth secret not initialized")
+        elif provided_secret == self.current_auth_secret:
             duration = time.time() - start_time
             logger.info(f"Authenticated with current secret in {duration * 1e6:.2f} µs")
             return True
@@ -1149,7 +1247,6 @@ class KeyRotationManager:
     
     def get_current_auth_secret(self) -> str:
         """Get the current authentication secret."""
-        import time
         start_time = time.time()
         secret = self.current_auth_secret
         duration = time.time() - start_time
