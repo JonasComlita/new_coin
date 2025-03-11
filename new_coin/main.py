@@ -12,6 +12,7 @@ import logging
 import aiohttp
 import argparse
 import os
+import yaml
 
 handler = logging.StreamHandler(sys.stdout)
 handler.setLevel(logging.INFO)
@@ -20,6 +21,10 @@ handler.setFormatter(formatter)
 logger = logging.getLogger("Blockchain")
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
+
+# Load CONFIG from config.yaml
+with open("config.yaml", "r") as f:
+    CONFIG = yaml.safe_load(f)
 
 async def health_check(host: str, port: int, retries: int = 5, delay: float = 1.0) -> bool:
     client_ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
@@ -31,7 +36,7 @@ async def health_check(host: str, port: int, retries: int = 5, delay: float = 1.
             async with aiohttp.ClientSession() as session:
                 url = f"https://{host}:{port}/get_chain"
                 logger.info(f"Attempting health check {attempt + 1}/{retries} on {url}")
-                async with session.get(url, headers=headers, ssl=client_ssl_context) as resp:
+                async with session.get(url, headers=headers, ssl=False) as resp:
                     logger.info(f"Health check response: {resp.status}")
                     return resp.status == 200
         except Exception as e:
@@ -40,30 +45,6 @@ async def health_check(host: str, port: int, retries: int = 5, delay: float = 1.
                 await asyncio.sleep(delay)
     logger.error("All health check attempts failed")
     return False
-
-def run_network(network: BlockchainNetwork, max_attempts: int = 3):
-    for attempt in range(max_attempts):
-        try:
-            logger.info(f"Starting network thread (attempt {attempt + 1}/{max_attempts})")
-            loop = network.loop  # Use the network's loop
-            runner = aiohttp.web.AppRunner(network.app)
-            loop.run_until_complete(runner.setup())
-            site = aiohttp.web.TCPSite(runner, network.host, network.port, ssl_context=network.ssl_context)
-            loop.run_until_complete(site.start())
-            logger.info(f"Network server running on {network.host}:{network.port}")
-            loop.run_forever()
-            break
-        except PermissionError as e:
-            logger.error(f"Port binding failed: {e}")
-            if attempt < max_attempts - 1:
-                network.port = find_available_port()
-                logger.info(f"Retrying with new port: {network.port}")
-            else:
-                logger.error("Max port binding attempts reached, aborting")
-                raise
-        except Exception as e:
-            logger.error(f"Network startup failed: {e}")
-            raise
 
 def shutdown(sig, frame, gui: BlockchainGUI, network: BlockchainNetwork):
     logger.info("Shutting down...")
@@ -87,24 +68,22 @@ if __name__ == "__main__":
     blockchain = Blockchain()
     bootstrap_nodes = []
     if args.bootstrap:
-        bootstrap_nodes = [tuple(node.split(":")) for node in args.bootstrap.split(",")]
-    elif port != 5000 and not os.path.exists("bootstrap_nodes.txt"):  # Fallback to default if not specified
+        bootstrap_nodes = [(node.split(":")[0], int(node.split(":")[1])) for node in args.bootstrap.split(",")]
+    elif port != 5000 and not os.path.exists("bootstrap_nodes.txt"):
         bootstrap_nodes = [("127.0.0.1", 5000)]
     elif os.path.exists("bootstrap_nodes.txt"):
         with open("bootstrap_nodes.txt", "r") as f:
-            bootstrap_nodes = [tuple(line.strip().split(":")) for line in f if line.strip()]
+            bootstrap_nodes = [(line.strip().split(":")[0], int(line.strip().split(":")[1])) for line in f if line.strip()]
     loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     network = BlockchainNetwork(blockchain, node_id, "127.0.0.1", port, loop, bootstrap_nodes)
-    # Start network in a daemon thread
-    network_thread = threading.Thread(target=run_network, args=(network,), daemon=True)
+    logger.info(f"Node {node_id} public key: {network.public_key}")
+    
+    # Start network using BlockchainNetwork.run()
+    network_thread = threading.Thread(target=network.run, daemon=True)
     network_thread.start()
     logger.info("Network thread started")
-
-    # Start periodic sync without blocking
-    if network.loop:
-        logger.info("Scheduling periodic sync task")
-        sync_coroutine = network.start_periodic_sync()
-        sync_task = asyncio.run_coroutine_threadsafe(sync_coroutine, network.loop)  # Schedule the coroutine
 
     # Wait and check network health
     logger.info("Waiting for network to initialize")

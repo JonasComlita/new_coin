@@ -4,3 +4,5 @@ cryptography==42.0.5
 prometheus-client==0.20.0
 pyyaml==6.0.1
 python-dotenv==1.0.1
+flask
+requests

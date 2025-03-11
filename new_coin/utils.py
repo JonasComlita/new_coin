@@ -11,10 +11,34 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import base64
 import socket
 from dotenv import load_dotenv
+from key_rotation.core import KeyRotationManager
+import requests
 
 # Load environment variables
 load_dotenv()
-PEER_AUTH_SECRET = os.getenv("PEER_AUTH_SECRET", os.urandom(32).hex())
+
+rotation_manager = KeyRotationManager()
+
+# Get the secret directly from the manager
+PEER_AUTH_SECRET = os.getenv("PEER_AUTH_SECRET")
+if not PEER_AUTH_SECRET:
+    PEER_AUTH_SECRET = rotation_manager.get_current_auth_secret()
+    if not PEER_AUTH_SECRET:
+        raise ValueError("Failed to get current secret from key rotation manager")
+
+# Function to validate peer authentication
+def validate_peer_auth(received_auth):
+    """
+    Validates peer authentication against current and previous secrets.
+    
+    Args:
+        received_auth (str): The authentication received from a peer
+        
+    Returns:
+        bool: True if authentication is valid, False otherwise
+    """
+    return rotation_manager.authenticate_peer(received_auth)
+
 SSL_CERT_PATH = os.getenv("SSL_CERT_PATH", "server.crt")
 SSL_KEY_PATH = os.getenv("SSL_KEY_PATH", "server.key")
 
@@ -22,6 +46,12 @@ if not os.path.exists(SSL_CERT_PATH) or not os.path.exists(SSL_KEY_PATH):
     result = os.system(f'openssl req -x509 -newkey rsa:2048 -keyout "{SSL_KEY_PATH}" -out "{SSL_CERT_PATH}" -days 365 -nodes -subj "/CN=localhost"')
     if result != 0:
         raise RuntimeError("Failed to generate SSL certificate with OpenSSL")
+
+# Define node key pair
+def generate_node_keypair():
+    private_key = ecdsa.SigningKey.generate(curve=ecdsa.SECP256k1)
+    public_key = private_key.get_verifying_key()
+    return private_key.to_string().hex(), public_key.to_string().hex()
     
 def load_config(config_file: str = "config.yaml") -> Dict:
     """Load and validate configuration from a YAML file.
