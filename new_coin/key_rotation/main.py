@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 import uuid
 
 def main():
+    os.environ['PEER_AUTH_SECRET'] = rotation_manager.get_current_auth_secret()
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Secure Key Rotation Service')
     parser.add_argument('--node-id', help='Unique node identifier')

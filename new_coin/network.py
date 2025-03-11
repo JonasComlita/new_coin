@@ -57,7 +57,7 @@ class BlockchainNetwork:
         self.client_ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         self.client_ssl_context.load_verify_locations(cafile=CONFIG["tls_cert_file"])  # Trust the same cert for simplicity
         self.client_ssl_context.check_hostname = False  # Optional, for self-signed certs
-        self.client_ssl_context.verify_mode = ssl.CERT_NONE  # Optional, for testing
+        self.client_ssl_context.verify_mode = ssl.CERT_REQUIRED  # Optional, for testing
 
         self.blockchain.network = self
         self.sync_task = None

@@ -829,7 +829,7 @@ class P2PNetwork:
                     continue
                 
                 # Send request
-                response = requests.post(f"{url}{endpoint}", json=payload, timeout=5)
+                response = requests.post(f"{url}{endpoint}", json=payload, timeout=5, verify='/path/to/ca.pem')
                 
                 if response.status_code == 200:
                     success_count += 1
@@ -1125,10 +1125,12 @@ class KeyRotationManager:
             return True
         
         # Check against previous secret (grace period)
-        if self.previous_auth_secret and provided_secret == self.previous_auth_secret:
-            logger.info("Peer authenticated with previous secret")
-            return True
-        
+        if self.previous_auth_secret:
+            last_rotation = self.secure_storage.retrieve("last_rotation_time") or "0"
+            if time.time() - float(last_rotation) < 172800:  # 48 hours
+                if provided_secret == self.previous_auth_secret:
+                    logger.info("Peer authenticated with previous secret")
+                    return True
         return False
     
     def get_current_auth_secret(self) -> str:
