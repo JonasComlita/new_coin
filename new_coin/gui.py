@@ -9,7 +9,7 @@ from queue import Queue
 from typing import Dict, List
 from blockchain import Blockchain, Block, Transaction, TransactionType, Miner
 from network import BlockchainNetwork
-from utils import SecurityUtils, generate_wallet, derive_key, Fernet
+from utils import SecurityUtils, generate_wallet, derive_key, Fernet, PEER_AUTH_SECRET
 import logging
 
 class BlockchainGUI:
@@ -218,8 +218,11 @@ class BlockchainGUI:
             messagebox.showerror("Error", "Port must be between 1 and 65535")
             return
         peer_id = f"node{port}"
-        self.network.add_peer(peer_id, host, port, "some_shared_secret")
-        self.update_peer_list()
+        success = asyncio.run_coroutine_threadsafe(self.network.add_peer(peer_id, host, port, PEER_AUTH_SECRET), self.network.loop).result()
+        if not success:
+            messagebox.showerror("Error", f"Failed to add peer {peer_id}")
+        else:
+            self.update_peer_list()
 
     def update_peer_list(self):
         self.peer_listbox.delete(0, tk.END)
@@ -234,7 +237,7 @@ class BlockchainGUI:
             return
         try:
             self.miner.wallet_address = self.wallets[name]["address"]
-            self.miner.start_mining()
+            self.miner.start_mining(self.network.loop)  # Pass the network's loop
             self.output.insert(tk.END, f"Mining started with wallet '{name}'\n")
         except Exception as e:
             messagebox.showerror("Error", f"Mining failed: {e}")

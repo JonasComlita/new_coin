@@ -10,6 +10,8 @@ from utils import find_available_port, PEER_AUTH_SECRET, SSL_CERT_PATH, SSL_KEY_
 from prometheus_client import start_http_server
 import logging
 import aiohttp
+import argparse
+import os
 
 handler = logging.StreamHandler(sys.stdout)
 handler.setLevel(logging.INFO)
@@ -43,14 +45,12 @@ def run_network(network: BlockchainNetwork, max_attempts: int = 3):
     for attempt in range(max_attempts):
         try:
             logger.info(f"Starting network thread (attempt {attempt + 1}/{max_attempts})")
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            loop = network.loop  # Use the network's loop
             runner = aiohttp.web.AppRunner(network.app)
             loop.run_until_complete(runner.setup())
             site = aiohttp.web.TCPSite(runner, network.host, network.port, ssl_context=network.ssl_context)
             loop.run_until_complete(site.start())
             logger.info(f"Network server running on {network.host}:{network.port}")
-            network.loop = loop
             loop.run_forever()
             break
         except PermissionError as e:
@@ -76,17 +76,25 @@ def shutdown(sig, frame, gui: BlockchainGUI, network: BlockchainNetwork):
     sys.exit(0)
 
 if __name__ == "__main__":
-    logger.info("Starting Prometheus metrics server on port 8000")
-    start_http_server(8000)
-    logger.info("Prometheus server started")
+    parser = argparse.ArgumentParser(description="Run a blockchain node.")
+    parser.add_argument("--port", type=int, default=None, help="Port to run the node on")
+    parser.add_argument("--bootstrap", type=str, default=None, help="Comma-separated list of bootstrap nodes (host:port)")
+    args = parser.parse_args()
 
-    port = find_available_port()
+    port = args.port if args.port else find_available_port()
     node_id = f"node{port}"
     logger.info(f"Initializing blockchain and network on port {port}")
     blockchain = Blockchain()
-    bootstrap_nodes = [("127.0.0.1", 5000)] if port != 5000 else []
-    network = BlockchainNetwork(blockchain, node_id, "127.0.0.1", port, bootstrap_nodes)
-
+    bootstrap_nodes = []
+    if args.bootstrap:
+        bootstrap_nodes = [tuple(node.split(":")) for node in args.bootstrap.split(",")]
+    elif port != 5000 and not os.path.exists("bootstrap_nodes.txt"):  # Fallback to default if not specified
+        bootstrap_nodes = [("127.0.0.1", 5000)]
+    elif os.path.exists("bootstrap_nodes.txt"):
+        with open("bootstrap_nodes.txt", "r") as f:
+            bootstrap_nodes = [tuple(line.strip().split(":")) for line in f if line.strip()]
+    loop = asyncio.new_event_loop()
+    network = BlockchainNetwork(blockchain, node_id, "127.0.0.1", port, loop, bootstrap_nodes)
     # Start network in a daemon thread
     network_thread = threading.Thread(target=run_network, args=(network,), daemon=True)
     network_thread.start()
@@ -95,7 +103,8 @@ if __name__ == "__main__":
     # Start periodic sync without blocking
     if network.loop:
         logger.info("Scheduling periodic sync task")
-        sync_task = asyncio.run_coroutine_threadsafe(network.start_periodic_sync(), network.loop)
+        sync_coroutine = network.start_periodic_sync()
+        sync_task = asyncio.run_coroutine_threadsafe(sync_coroutine, network.loop)  # Schedule the coroutine
 
     # Wait and check network health
     logger.info("Waiting for network to initialize")
