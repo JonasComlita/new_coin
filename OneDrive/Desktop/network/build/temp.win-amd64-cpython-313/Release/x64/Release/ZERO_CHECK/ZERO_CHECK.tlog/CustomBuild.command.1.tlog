@@ -1,0 +1,10 @@
+^C:\USERS\JDMAN\ONEDRIVE\DESKTOP\NETWORK\BUILD\TEMP.WIN-AMD64-CPYTHON-313\RELEASE\CMAKEFILES\D4E6EF1CE1E065CDC5FB4C9C78BCA417\GENERATE.STAMP.RULE
+setlocal
+C:\Users\jdman\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\cmake\data\bin\cmake.exe -SC:/Users/jdman/OneDrive/Desktop/network -BC:/Users/jdman/OneDrive/Desktop/network/build/temp.win-amd64-cpython-313/Release --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file C:/Users/jdman/OneDrive/Desktop/network/build/temp.win-amd64-cpython-313/Release/blockchain_extensions.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

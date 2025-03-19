@@ -1,0 +1,10 @@
+{
+  "difficulty": 4,
+  "current_reward": 50.0,
+  "halving_interval": 210000,
+  "mempool_max_size": 1000,
+  "max_retries": 3,
+  "sync_interval": 300,
+  "use_gpu": false,
+  "mining_workers": 2
+}

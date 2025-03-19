@@ -1,0 +1,3 @@
+C:/Users/jdman/OneDrive/Desktop/network/build/temp.win-amd64-cpython-313/Release/CMakeFiles/blockchain_cpp.dir
+C:/Users/jdman/OneDrive/Desktop/network/build/temp.win-amd64-cpython-313/Release/CMakeFiles/ALL_BUILD.dir
+C:/Users/jdman/OneDrive/Desktop/network/build/temp.win-amd64-cpython-313/Release/CMakeFiles/ZERO_CHECK.dir
